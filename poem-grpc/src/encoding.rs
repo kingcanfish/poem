@@ -147,8 +147,8 @@ impl DataFrameDecoder {
 
             if compressed {
                 let compression = self.compression.ok_or_else(|| {
-                    Status::new(Code::Unimplemented)
-                        .with_message(format!("unsupported compressed flag: {compressed}"))
+                    Status::new(Code::Internal)
+                        .with_message("compressed message without a grpc-encoding")
                 })?;
                 let data = compression
                     .decode(&data, self.max_size)

@@ -6,7 +6,7 @@ use crate::{
     Code, CompressionEncoding, Metadata, MethodType, Request as GrpcRequest,
     Response as GrpcResponse, Status, Streaming,
     codec::Codec,
-    compression::get_incoming_encodings,
+    compression::{accept_encoding_header, get_request_encoding, select_response_encoding},
     encoding::{
         DEFAULT_MAX_DECODING_MESSAGE_SIZE, DEFAULT_MAX_ENCODING_MESSAGE_SIZE,
         create_decode_request_body, create_encode_response_body,
@@ -69,14 +69,37 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
         self
     }
 
+    /// Creates a response telling the client which encodings its requests
+    /// can use, which the gRPC spec requires of one rejecting a request for
+    /// its encoding.
+    fn create_response(&self) -> Response {
+        let mut resp = Response::default().set_content_type(T::CONTENT_TYPES[0]);
+        resp.headers_mut().insert(
+            "grpc-accept-encoding",
+            accept_encoding_header(self.accept_compressed),
+        );
+        resp
+    }
+
+    /// Returns the encoding of the request's messages, and keeps the
+    /// configured encoding for the response's only if the client accepts it.
+    fn negotiate_encodings(
+        &mut self,
+        headers: &http::HeaderMap,
+    ) -> Result<Option<CompressionEncoding>, Status> {
+        let incoming_encoding = get_request_encoding(headers, self.accept_compressed)?;
+        self.send_compressed =
+            select_response_encoding(headers, self.send_compressed, incoming_encoding);
+        Ok(incoming_encoding)
+    }
+
     pub async fn unary<S>(mut self, service: S, request: Request) -> Response
     where
         S: UnaryService<T::Decode, Response = T::Encode>,
     {
         let (parts, body) = request.into_parts();
-        let mut resp = Response::default().set_content_type(T::CONTENT_TYPES[0]);
-        let incoming_encoding = match get_incoming_encodings(&parts.headers, self.accept_compressed)
-        {
+        let mut resp = self.create_response();
+        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
             Ok(incoming_encoding) => incoming_encoding,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -114,7 +137,13 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.send_compressed,
                     self.max_encoding_message_size,
                 );
-                update_http_response(&mut resp, metadata, body, self.send_compressed);
+                update_http_response(
+                    &mut resp,
+                    metadata,
+                    body,
+                    self.send_compressed,
+                    self.accept_compressed,
+                );
             }
             Err(status) => resp.headers_mut().extend(status.to_headers()),
         }
@@ -127,9 +156,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
         S: ClientStreamingService<T::Decode, Response = T::Encode>,
     {
         let (parts, body) = request.into_parts();
-        let mut resp = Response::default().set_content_type(T::CONTENT_TYPES[0]);
-        let incoming_encoding = match get_incoming_encodings(&parts.headers, self.accept_compressed)
-        {
+        let mut resp = self.create_response();
+        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
             Ok(incoming_encoding) => incoming_encoding,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -162,7 +190,13 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.send_compressed,
                     self.max_encoding_message_size,
                 );
-                update_http_response(&mut resp, metadata, body, self.send_compressed);
+                update_http_response(
+                    &mut resp,
+                    metadata,
+                    body,
+                    self.send_compressed,
+                    self.accept_compressed,
+                );
             }
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -177,9 +211,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
         S: ServerStreamingService<T::Decode, Response = T::Encode>,
     {
         let (parts, body) = request.into_parts();
-        let mut resp = Response::default().set_content_type(T::CONTENT_TYPES[0]);
-        let incoming_encoding = match get_incoming_encodings(&parts.headers, self.accept_compressed)
-        {
+        let mut resp = self.create_response();
+        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
             Ok(incoming_encoding) => incoming_encoding,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -217,7 +250,13 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.send_compressed,
                     self.max_encoding_message_size,
                 );
-                update_http_response(&mut resp, metadata, body, self.send_compressed);
+                update_http_response(
+                    &mut resp,
+                    metadata,
+                    body,
+                    self.send_compressed,
+                    self.accept_compressed,
+                );
             }
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -232,9 +271,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
         S: BidirectionalStreamingService<T::Decode, Response = T::Encode>,
     {
         let (parts, body) = request.into_parts();
-        let mut resp = Response::default().set_content_type(T::CONTENT_TYPES[0]);
-        let incoming_encoding = match get_incoming_encodings(&parts.headers, self.accept_compressed)
-        {
+        let mut resp = self.create_response();
+        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
             Ok(incoming_encoding) => incoming_encoding,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -267,7 +305,13 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.send_compressed,
                     self.max_encoding_message_size,
                 );
-                update_http_response(&mut resp, metadata, body, self.send_compressed);
+                update_http_response(
+                    &mut resp,
+                    metadata,
+                    body,
+                    self.send_compressed,
+                    self.accept_compressed,
+                );
             }
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
@@ -301,8 +345,15 @@ fn update_http_response(
     metadata: Metadata,
     body: Body,
     send_compressed: Option<CompressionEncoding>,
+    accept_compressed: &[CompressionEncoding],
 ) {
     resp.headers_mut().extend(metadata.headers);
+    // Not what the handler's metadata says, e.g. when it forwards another
+    // server's response.
+    resp.headers_mut().insert(
+        "grpc-accept-encoding",
+        accept_encoding_header(accept_compressed),
+    );
     if let Some(send_compressed) = send_compressed {
         resp.headers_mut().insert(
             "grpc-encoding",
@@ -916,5 +967,236 @@ mod tests {
             len(&cli, MIB).await.unwrap_err().code(),
             Code::ResourceExhausted
         );
+    }
+
+    #[cfg(feature = "gzip")]
+    mod compression {
+        use bytes::Bytes;
+        use http::HeaderMap;
+        use http_body_util::BodyExt;
+
+        use super::*;
+        use crate::client::BoxBody;
+
+        const GZIP: CompressionEncoding = CompressionEncoding::GZIP;
+
+        /// A response's headers, data and trailers.
+        struct RawResponse {
+            headers: HeaderMap,
+            data: Vec<u8>,
+            trailers: HeaderMap,
+        }
+
+        impl RawResponse {
+            /// The `grpc-status`, from the trailers or a Trailers-Only
+            /// response's headers.
+            fn status(&self) -> &str {
+                self.trailers
+                    .get("grpc-status")
+                    .or_else(|| self.headers.get("grpc-status"))
+                    .expect("grpc-status")
+                    .to_str()
+                    .unwrap()
+            }
+
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers.get(name).map(|value| value.to_str().unwrap())
+            }
+        }
+
+        /// Calls `Subtract` on a server sending `send` and accepting `accept`
+        /// with a request of these `headers` and `body`.
+        async fn call(
+            send: Option<CompressionEncoding>,
+            accept: &[CompressionEncoding],
+            headers: &[(&str, &str)],
+            body: impl Into<Bytes>,
+        ) -> RawResponse {
+            let mut req = Request::builder().content_type("application/grpc");
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            let resp = GrpcServer::new(I32Codec, send, accept)
+                .unary(Subtract, req.body(body.into()))
+                .await;
+            let (parts, body) = resp.into_parts();
+            let mut body: BoxBody = body.into();
+            let mut data = vec![];
+            let mut trailers = HeaderMap::new();
+            while let Some(frame) = body.frame().await {
+                match frame.unwrap().into_data() {
+                    Ok(bytes) => data.extend(bytes),
+                    Err(frame) => trailers = frame.into_trailers().unwrap(),
+                }
+            }
+            RawResponse {
+                headers: parts.headers,
+                data,
+                trailers,
+            }
+        }
+
+        /// The request message `3`, uncompressed.
+        const THREE: [u8; 9] = [0, 0, 0, 0, 4, 0, 0, 0, 3];
+
+        /// The request message `3`, compressed with `encoding`.
+        async fn compressed_three(encoding: CompressionEncoding) -> Vec<u8> {
+            let data = encoding.encode(&3i32.to_be_bytes()).await.unwrap();
+            let mut message = vec![1];
+            message.extend((data.len() as u32).to_be_bytes());
+            message.extend(data);
+            message
+        }
+
+        /// Checks that `resp` carries the message `7`, compressed or not.
+        async fn assert_seven(resp: &RawResponse, compressed: bool) {
+            assert_eq!(resp.status(), "0");
+            if compressed {
+                assert_eq!(resp.header("grpc-encoding"), Some("gzip"));
+                assert_eq!(resp.data[0], 1);
+                let data = GZIP.decode(&resp.data[5..], usize::MAX).await.unwrap();
+                assert_eq!(data.unwrap(), 7i32.to_be_bytes());
+            } else {
+                assert_eq!(resp.header("grpc-encoding"), None);
+                assert_eq!(resp.data, [0, 0, 0, 0, 4, 0, 0, 0, 7]);
+            }
+        }
+
+        /// The server compresses a response only for a client that accepts
+        /// the encoding: one listing it in `grpc-accept-encoding`, or using
+        /// it for the request.
+        #[tokio::test]
+        async fn response_encoding_follows_client() {
+            let resp = call(Some(GZIP), &[], &[], &THREE[..]).await;
+            assert_seven(&resp, false).await;
+
+            for accepted in ["gzip", "identity,gzip", "identity, deflate , gzip", "GZIP"] {
+                let headers = [("grpc-accept-encoding", accepted)];
+                let resp = call(Some(GZIP), &[], &headers, &THREE[..]).await;
+                assert_seven(&resp, accepted != "GZIP").await;
+            }
+
+            for accepted in ["", "identity", "deflate, br", "gzipped", "x-gzip"] {
+                let headers = [("grpc-accept-encoding", accepted)];
+                let resp = call(Some(GZIP), &[], &headers, &THREE[..]).await;
+                assert_seven(&resp, false).await;
+            }
+
+            // Listed in a second header.
+            let headers = [
+                ("grpc-accept-encoding", "identity"),
+                ("grpc-accept-encoding", "gzip"),
+            ];
+            let resp = call(Some(GZIP), &[], &headers, &THREE[..]).await;
+            assert_seven(&resp, true).await;
+
+            // Used for the request, by a client that doesn't say what it
+            // accepts.
+            let headers = [("grpc-encoding", "gzip")];
+            let body = compressed_three(GZIP).await;
+            let resp = call(Some(GZIP), &[GZIP], &headers, body.clone()).await;
+            assert_seven(&resp, true).await;
+
+            // Used for the request, but not accepted.
+            let headers = [
+                ("grpc-encoding", "gzip"),
+                ("grpc-accept-encoding", "identity"),
+            ];
+            let resp = call(Some(GZIP), &[GZIP], &headers, body).await;
+            assert_seven(&resp, false).await;
+
+            // A server not configured to compress doesn't.
+            let headers = [("grpc-accept-encoding", "gzip")];
+            let resp = call(None, &[GZIP], &headers, &THREE[..]).await;
+            assert_seven(&resp, false).await;
+        }
+
+        /// A request in an encoding the server doesn't accept fails with
+        /// `Unimplemented` and a `grpc-accept-encoding` header listing the
+        /// ones it does.
+        #[tokio::test]
+        async fn unsupported_request_encoding() {
+            let body = compressed_three(GZIP).await;
+
+            let resp = call(None, &[], &[("grpc-encoding", "gzip")], body.clone()).await;
+            assert_eq!(resp.status(), "12");
+            assert_eq!(resp.header("grpc-accept-encoding"), Some("identity"));
+            assert!(resp.data.is_empty());
+
+            let resp = call(None, &[GZIP], &[("grpc-encoding", "snappy")], body).await;
+            assert_eq!(resp.status(), "12");
+            assert_eq!(resp.header("grpc-accept-encoding"), Some("identity, gzip"));
+        }
+
+        /// `identity` is the name of no compression.
+        #[tokio::test]
+        async fn identity_request_encoding() {
+            let resp = call(None, &[], &[("grpc-encoding", "identity")], &THREE[..]).await;
+            assert_seven(&resp, false).await;
+        }
+
+        /// A server tells every client the encodings it accepts.
+        #[tokio::test]
+        async fn accepted_encodings_are_advertised() {
+            let resp = call(None, &[GZIP], &[], &THREE[..]).await;
+            assert_seven(&resp, false).await;
+            assert_eq!(resp.header("grpc-accept-encoding"), Some("identity, gzip"));
+
+            let resp = call(None, &[], &[], &THREE[..]).await;
+            assert_eq!(resp.header("grpc-accept-encoding"), Some("identity"));
+        }
+
+        /// Forwards the metadata of another server's response.
+        struct Forward;
+
+        impl UnaryService<i32> for Forward {
+            type Response = i32;
+
+            async fn call(&self, request: GrpcRequest<i32>) -> Result<GrpcResponse<i32>, Status> {
+                let mut resp = GrpcResponse::new(request.into_inner());
+                resp.metadata_mut().insert("grpc-accept-encoding", "snappy");
+                resp.metadata_mut().append("grpc-accept-encoding", "lz4");
+                resp.metadata_mut().insert("x-upstream", "1");
+                Ok(resp)
+            }
+        }
+
+        /// The encodings a server advertises are its own, whatever the
+        /// handler's response metadata says.
+        #[tokio::test]
+        async fn advertised_encodings_are_the_servers() {
+            let req = Request::builder()
+                .content_type("application/grpc")
+                .body(&THREE[..]);
+            let resp = GrpcServer::new(I32Codec, None, &[GZIP])
+                .unary(Forward, req)
+                .await;
+            let values: Vec<_> = resp
+                .headers()
+                .get_all("grpc-accept-encoding")
+                .iter()
+                .collect();
+            assert_eq!(values, ["identity, gzip"]);
+            assert_eq!(resp.headers()["x-upstream"], "1");
+        }
+
+        /// A message with the Compressed-Flag set in a request without a
+        /// `grpc-encoding` fails with `Internal`.
+        #[tokio::test]
+        async fn compressed_flag_without_encoding() {
+            let body = compressed_three(GZIP).await;
+            for headers in [&[][..], &[("grpc-encoding", "identity")][..]] {
+                let resp = call(None, &[GZIP], headers, body.clone()).await;
+                assert_eq!(resp.status(), "13");
+            }
+        }
+
+        /// An uncompressed message in a request with a `grpc-encoding` is
+        /// read as it is.
+        #[tokio::test]
+        async fn uncompressed_message_with_encoding() {
+            let resp = call(None, &[GZIP], &[("grpc-encoding", "gzip")], &THREE[..]).await;
+            assert_seven(&resp, false).await;
+        }
     }
 }

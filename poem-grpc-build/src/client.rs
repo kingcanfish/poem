@@ -123,6 +123,9 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
             }
 
             /// Set the compression encodings for accepting
+            ///
+            /// They are sent to the server in `grpc-accept-encoding`. A
+            /// server only compresses its responses with one of them.
             pub fn set_accept_compressed(&mut self, encodings: impl ::std::convert::Into<::std::sync::Arc<[#crate_name::CompressionEncoding]>>) {
                 self.cli.set_accept_compressed(encodings);
             }

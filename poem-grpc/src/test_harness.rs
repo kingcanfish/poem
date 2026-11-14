@@ -427,4 +427,122 @@ mod tests {
             .into_inner();
         assert_resource_exhausted(responses.try_next().await, message);
     }
+
+    /// Calls of every kind between a generated client and server that both
+    /// send and accept `encoding`, whose responses are then compressed too.
+    #[cfg(any(
+        feature = "gzip",
+        feature = "deflate",
+        feature = "brotli",
+        feature = "zstd"
+    ))]
+    async fn compressed_calls(encoding: crate::CompressionEncoding) {
+        let server = TestHarnessServer::new(TestHarnessService)
+            .send_compressed(encoding)
+            .accept_compressed([encoding]);
+        let mut cli = create_cli_with(server);
+        cli.set_send_compressed(encoding);
+        cli.set_accept_compressed([encoding]);
+
+        let resp = cli
+            .unary(Request::new(UnaryRequest { a: 10, b: 20 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata().get("grpc-encoding"),
+            Some(encoding.as_str())
+        );
+        assert_eq!(resp.into_inner().value, 30);
+
+        let resp = cli.client_streaming(values(&[1, 2, 3])).await.unwrap();
+        assert_eq!(
+            resp.metadata().get("grpc-encoding"),
+            Some(encoding.as_str())
+        );
+        assert_eq!(resp.into_inner().value, 6);
+
+        let resp = cli
+            .server_streaming(Request::new(ValueRequest { value: 2 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata().get("grpc-encoding"),
+            Some(encoding.as_str())
+        );
+        let responses: Vec<_> = resp.into_inner().try_collect().await.unwrap();
+        assert_eq!(responses.len(), 3);
+
+        let resp = cli
+            .bidirectional_streaming(values(&[1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata().get("grpc-encoding"),
+            Some(encoding.as_str())
+        );
+        let responses: Vec<_> = resp.into_inner().try_collect().await.unwrap();
+        assert_eq!(responses.last().unwrap().value, 6);
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn gzip_calls() {
+        compressed_calls(crate::CompressionEncoding::GZIP).await;
+    }
+
+    #[cfg(feature = "deflate")]
+    #[tokio::test]
+    async fn deflate_calls() {
+        compressed_calls(crate::CompressionEncoding::DEFLATE).await;
+    }
+
+    #[cfg(feature = "brotli")]
+    #[tokio::test]
+    async fn brotli_calls() {
+        compressed_calls(crate::CompressionEncoding::BROTLI).await;
+    }
+
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn zstd_calls() {
+        compressed_calls(crate::CompressionEncoding::ZSTD).await;
+    }
+
+    /// A generated server configured to compress doesn't for a client that
+    /// doesn't accept the encoding, which would fail to read the response.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn response_not_compressed_for_other_clients() {
+        use crate::CompressionEncoding;
+
+        let server =
+            TestHarnessServer::new(TestHarnessService).send_compressed(CompressionEncoding::GZIP);
+        let cli = create_cli_with(server);
+        let resp = cli
+            .unary(Request::new(UnaryRequest { a: 10, b: 20 }))
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata().get("grpc-encoding"), None);
+        assert_eq!(resp.into_inner().value, 30);
+    }
+
+    /// Nor for a client that compresses its requests with that encoding but
+    /// wasn't set to accept it.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn response_not_compressed_for_send_only_client() {
+        use crate::CompressionEncoding;
+
+        let server = TestHarnessServer::new(TestHarnessService)
+            .send_compressed(CompressionEncoding::GZIP)
+            .accept_compressed([CompressionEncoding::GZIP]);
+        let mut cli = create_cli_with(server);
+        cli.set_send_compressed(CompressionEncoding::GZIP);
+        let resp = cli
+            .unary(Request::new(UnaryRequest { a: 10, b: 20 }))
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata().get("grpc-encoding"), None);
+        assert_eq!(resp.into_inner().value, 30);
+    }
 }

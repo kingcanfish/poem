@@ -168,6 +168,9 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
             }
 
             /// Set the compression encoding for sending
+            ///
+            /// A response is only compressed for a client that accepts the
+            /// encoding, i.e. lists it in `grpc-accept-encoding`.
             pub fn send_compressed(self, encoding: #crate_name::CompressionEncoding) -> Self {
                 Self {
                     send_compressed: Some(encoding),
@@ -176,6 +179,8 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
             }
 
             /// Set the compression encodings for accepting
+            ///
+            /// They are advertised to clients in `grpc-accept-encoding`.
             pub fn accept_compressed(self, encodings: impl ::std::convert::Into<::std::sync::Arc<[#crate_name::CompressionEncoding]>>) -> Self {
                 Self {
                     accept_compressed: encodings.into(),
