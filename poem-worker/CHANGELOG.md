@@ -7,6 +7,10 @@
 - Upgrade to Poem 4 and require Rust 1.94. [Migration guide](../docs/migration-4.0.md)
 - Upgrade Worker from 0.6 to 0.8. Align direct Worker dependencies used for `Env`, bindings, requests, responses and errors. The standalone example uses worker-build 0.8 and the `build/index.js` entry point. [#1198](https://github.com/poem-web/poem/pull/1198)
 
+## Fixed
+
+- A `fetch` event arriving before `Server::run` was called is answered with a 500 and logs an error naming the cause, instead of panicking on an `unwrap`.
+
 ## Release status
 
 - `poem-worker` is outside the automated crate-publishing workflow. This version bump records its incompatible dependency boundary; it does not enable publication.
