@@ -7,7 +7,10 @@ use crate::{
     Response as GrpcResponse, Status, Streaming,
     codec::Codec,
     compression::get_incoming_encodings,
-    encoding::{create_decode_request_body, create_encode_response_body},
+    encoding::{
+        DEFAULT_MAX_DECODING_MESSAGE_SIZE, DEFAULT_MAX_ENCODING_MESSAGE_SIZE,
+        create_decode_request_body, create_encode_response_body,
+    },
     service::{
         BidirectionalStreamingService, ClientStreamingService, ServerStreamingService, UnaryService,
     },
@@ -30,6 +33,8 @@ pub struct GrpcServer<'a, T> {
     codec: T,
     send_compressed: Option<CompressionEncoding>,
     accept_compressed: &'a [CompressionEncoding],
+    max_decoding_message_size: usize,
+    max_encoding_message_size: usize,
 }
 
 impl<'a, T: Codec> GrpcServer<'a, T> {
@@ -43,7 +48,25 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
             codec,
             send_compressed,
             accept_compressed,
+            max_decoding_message_size: DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+            max_encoding_message_size: DEFAULT_MAX_ENCODING_MESSAGE_SIZE,
         }
+    }
+
+    /// Limits the size of a request message, `None` being the default of
+    /// 4 MiB.
+    #[inline]
+    pub fn max_decoding_message_size(mut self, limit: Option<usize>) -> Self {
+        self.max_decoding_message_size = limit.unwrap_or(DEFAULT_MAX_DECODING_MESSAGE_SIZE);
+        self
+    }
+
+    /// Limits the size of a response message, `None` being the default of no
+    /// limit.
+    #[inline]
+    pub fn max_encoding_message_size(mut self, limit: Option<usize>) -> Self {
+        self.max_encoding_message_size = limit.unwrap_or(DEFAULT_MAX_ENCODING_MESSAGE_SIZE);
+        self
     }
 
     pub async fn unary<S>(mut self, service: S, request: Request) -> Response
@@ -60,7 +83,12 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                 return resp;
             }
         };
-        let mut stream = create_decode_request_body(self.codec.decoder(), body, incoming_encoding);
+        let mut stream = create_decode_request_body(
+            self.codec.decoder(),
+            body,
+            incoming_encoding,
+            self.max_decoding_message_size,
+        );
 
         let res = match read_single_message(&mut stream).await {
             Ok(message) => {
@@ -84,6 +112,7 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.codec.encoder(),
                     Streaming::new(futures_util::stream::once(async move { Ok(message) })),
                     self.send_compressed,
+                    self.max_encoding_message_size,
                 );
                 update_http_response(&mut resp, metadata, body, self.send_compressed);
             }
@@ -107,7 +136,12 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                 return resp;
             }
         };
-        let stream = create_decode_request_body(self.codec.decoder(), body, incoming_encoding);
+        let stream = create_decode_request_body(
+            self.codec.decoder(),
+            body,
+            incoming_encoding,
+            self.max_decoding_message_size,
+        );
 
         let res = service
             .call(GrpcRequest {
@@ -126,6 +160,7 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.codec.encoder(),
                     Streaming::new(futures_util::stream::once(async move { Ok(message) })),
                     self.send_compressed,
+                    self.max_encoding_message_size,
                 );
                 update_http_response(&mut resp, metadata, body, self.send_compressed);
             }
@@ -151,7 +186,12 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                 return resp;
             }
         };
-        let mut stream = create_decode_request_body(self.codec.decoder(), body, incoming_encoding);
+        let mut stream = create_decode_request_body(
+            self.codec.decoder(),
+            body,
+            incoming_encoding,
+            self.max_decoding_message_size,
+        );
 
         let res = match read_single_message(&mut stream).await {
             Ok(message) => {
@@ -175,6 +215,7 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.codec.encoder(),
                     message,
                     self.send_compressed,
+                    self.max_encoding_message_size,
                 );
                 update_http_response(&mut resp, metadata, body, self.send_compressed);
             }
@@ -200,7 +241,12 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                 return resp;
             }
         };
-        let stream = create_decode_request_body(self.codec.decoder(), body, incoming_encoding);
+        let stream = create_decode_request_body(
+            self.codec.decoder(),
+            body,
+            incoming_encoding,
+            self.max_decoding_message_size,
+        );
 
         let res = service
             .call(GrpcRequest {
@@ -219,6 +265,7 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
                     self.codec.encoder(),
                     message,
                     self.send_compressed,
+                    self.max_encoding_message_size,
                 );
                 update_http_response(&mut resp, metadata, body, self.send_compressed);
             }
@@ -480,5 +527,394 @@ mod tests {
         let status = status.unwrap();
         assert_eq!(status.code(), Code::NotFound);
         assert_eq!(status.message(), Some("gone"));
+    }
+
+    /// Encodes and decodes a message as its bytes.
+    #[derive(Default)]
+    struct BytesCodec;
+
+    impl Codec for BytesCodec {
+        const CONTENT_TYPES: &'static [&'static str] = &["application/grpc"];
+
+        type Encode = Vec<u8>;
+        type Decode = Vec<u8>;
+        type Encoder = BytesCodec;
+        type Decoder = BytesCodec;
+
+        fn encoder(&mut self) -> Self::Encoder {
+            BytesCodec
+        }
+
+        fn decoder(&mut self) -> Self::Decoder {
+            BytesCodec
+        }
+    }
+
+    impl Encoder for BytesCodec {
+        type Item = Vec<u8>;
+
+        fn encode(&mut self, message: Vec<u8>, buf: &mut BytesMut) -> IoResult<()> {
+            buf.put_slice(&message);
+            Ok(())
+        }
+    }
+
+    impl Decoder for BytesCodec {
+        type Item = Vec<u8>;
+
+        fn decode(&mut self, buf: &[u8]) -> IoResult<Vec<u8>> {
+            Ok(buf.to_vec())
+        }
+    }
+
+    fn len_message(len: usize) -> Vec<u8> {
+        (len as u32).to_be_bytes().to_vec()
+    }
+
+    fn message_len(mut message: &[u8]) -> usize {
+        message.get_u32() as usize
+    }
+
+    /// Responds with the total length of the request messages.
+    struct Len;
+
+    impl UnaryService<Vec<u8>> for Len {
+        type Response = Vec<u8>;
+
+        async fn call(
+            &self,
+            request: GrpcRequest<Vec<u8>>,
+        ) -> Result<GrpcResponse<Vec<u8>>, Status> {
+            Ok(GrpcResponse::new(len_message(request.into_inner().len())))
+        }
+    }
+
+    impl ClientStreamingService<Vec<u8>> for Len {
+        type Response = Vec<u8>;
+
+        async fn call(
+            &self,
+            request: GrpcRequest<Streaming<Vec<u8>>>,
+        ) -> Result<GrpcResponse<Vec<u8>>, Status> {
+            let len = request
+                .into_inner()
+                .try_fold(0, |len, message| async move { Ok(len + message.len()) })
+                .await?;
+            Ok(GrpcResponse::new(len_message(len)))
+        }
+    }
+
+    /// Responds with a message of as many bytes as the request asks for; when
+    /// streaming, between two messages of one byte.
+    struct Blob;
+
+    impl UnaryService<Vec<u8>> for Blob {
+        type Response = Vec<u8>;
+
+        async fn call(
+            &self,
+            request: GrpcRequest<Vec<u8>>,
+        ) -> Result<GrpcResponse<Vec<u8>>, Status> {
+            Ok(GrpcResponse::new(vec![
+                0;
+                message_len(&request.into_inner())
+            ]))
+        }
+    }
+
+    impl ServerStreamingService<Vec<u8>> for Blob {
+        type Response = Vec<u8>;
+
+        async fn call(
+            &self,
+            request: GrpcRequest<Vec<u8>>,
+        ) -> Result<GrpcResponse<Streaming<Vec<u8>>>, Status> {
+            let len = message_len(&request.into_inner());
+            Ok(GrpcResponse::new_streaming(futures_util::stream::iter([
+                Ok(vec![0]),
+                Ok(vec![0; len]),
+                Ok(vec![0]),
+            ])))
+        }
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Serves `Len` and `Blob` over HTTP/2 with the given message size limits,
+    /// and returns a client for them.
+    async fn serve_bytes(decoding: Option<usize>, encoding: Option<usize>) -> GrpcClient {
+        serve_compressed_bytes(decoding, encoding, None).await
+    }
+
+    /// Same, with a server that sends and accepts `compression`.
+    async fn serve_compressed_bytes(
+        decoding: Option<usize>,
+        encoding: Option<usize>,
+        compression: Option<CompressionEncoding>,
+    ) -> GrpcClient {
+        let server = move || {
+            let accept: &'static [CompressionEncoding] = match compression {
+                Some(compression) => vec![compression].leak(),
+                None => &[],
+            };
+            GrpcServer::new(BytesCodec, compression, accept)
+                .max_decoding_message_size(decoding)
+                .max_encoding_message_size(encoding)
+        };
+
+        let app = poem::Route::new()
+            .at(
+                "/len",
+                poem::endpoint::make(move |req| async move { server().unary(Len, req).await }),
+            )
+            .at(
+                "/total_len",
+                poem::endpoint::make(move |req| async move {
+                    server().client_streaming(Len, req).await
+                }),
+            )
+            .at(
+                "/blob",
+                poem::endpoint::make(move |req| async move { server().unary(Blob, req).await }),
+            )
+            .at(
+                "/blobs",
+                poem::endpoint::make(move |req| async move {
+                    server().server_streaming(Blob, req).await
+                }),
+            );
+        let acceptor = TcpListener::bind("127.0.0.1:0")
+            .into_acceptor()
+            .await
+            .unwrap();
+        let addr = *acceptor.local_addr()[0].as_socket_addr().unwrap();
+        tokio::spawn(Server::new_with_acceptor(acceptor).run(app));
+        GrpcClient::new(
+            ClientConfig::builder()
+                .uri(format!("http://{addr}"))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Sends a message of `len` bytes, and returns the length the server
+    /// received.
+    async fn len(cli: &GrpcClient, len: usize) -> Result<usize, Status> {
+        let resp = cli
+            .unary("/len", BytesCodec, GrpcRequest::new(vec![0; len]))
+            .await?;
+        Ok(message_len(&resp.into_inner()))
+    }
+
+    /// Sends messages of `lens` bytes, and returns the total length the
+    /// server received.
+    async fn total_len(cli: &GrpcClient, lens: &[usize]) -> Result<usize, Status> {
+        let messages: Vec<_> = lens.iter().map(|len| Ok(vec![0; *len])).collect();
+        let request = GrpcRequest::new_streaming(futures_util::stream::iter(messages));
+        let resp = cli
+            .client_streaming("/total_len", BytesCodec, request)
+            .await?;
+        Ok(message_len(&resp.into_inner()))
+    }
+
+    /// Asks for a message of `len` bytes, and returns the length received.
+    async fn blob(cli: &GrpcClient, len: usize) -> Result<usize, Status> {
+        let resp = cli
+            .unary("/blob", BytesCodec, GrpcRequest::new(len_message(len)))
+            .await?;
+        Ok(resp.into_inner().len())
+    }
+
+    /// Asks for a message of `len` bytes between two of one byte, and returns
+    /// the lengths received before the stream's end, and the status it ended
+    /// with, if not OK.
+    async fn blobs(cli: &GrpcClient, len: usize) -> (Vec<usize>, Option<Status>) {
+        let mut stream = cli
+            .server_streaming("/blobs", BytesCodec, GrpcRequest::new(len_message(len)))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut lens = vec![];
+        loop {
+            match stream.try_next().await {
+                Ok(Some(message)) => lens.push(message.len()),
+                Ok(None) => return (lens, None),
+                Err(status) => return (lens, Some(status)),
+            }
+        }
+    }
+
+    fn assert_resource_exhausted(status: Status, message: &str) {
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.message(), Some(message));
+    }
+
+    /// By default the server accepts a request message of up to 4 MiB, and
+    /// rejects a larger one without breaking the connection.
+    #[tokio::test]
+    async fn default_request_size_limit() {
+        let cli = serve_bytes(None, None).await;
+        assert_eq!(len(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+        assert_resource_exhausted(
+            len(&cli, 4 * MIB + 1).await.unwrap_err(),
+            "received message larger than max (4194305 vs. 4194304)",
+        );
+        assert_resource_exhausted(
+            total_len(&cli, &[1, 4 * MIB + 1, 1]).await.unwrap_err(),
+            "received message larger than max (4194305 vs. 4194304)",
+        );
+        assert_eq!(len(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+        assert_eq!(total_len(&cli, &[4 * MIB, 4 * MIB]).await.unwrap(), 8 * MIB);
+    }
+
+    /// The server's limit on request messages can be lowered and raised.
+    #[tokio::test]
+    async fn request_size_limit() {
+        let cli = serve_bytes(Some(16), None).await;
+        assert_eq!(len(&cli, 16).await.unwrap(), 16);
+        assert_resource_exhausted(
+            len(&cli, 17).await.unwrap_err(),
+            "received message larger than max (17 vs. 16)",
+        );
+        assert_eq!(total_len(&cli, &[16, 16, 16]).await.unwrap(), 48);
+        assert_resource_exhausted(
+            total_len(&cli, &[16, 17, 16]).await.unwrap_err(),
+            "received message larger than max (17 vs. 16)",
+        );
+
+        let cli = serve_bytes(Some(6 * MIB), None).await;
+        assert_eq!(len(&cli, 6 * MIB).await.unwrap(), 6 * MIB);
+        assert_resource_exhausted(
+            len(&cli, 6 * MIB + 1).await.unwrap_err(),
+            "received message larger than max (6291457 vs. 6291456)",
+        );
+
+        // Only an empty message fits a limit of 0.
+        let cli = serve_bytes(Some(0), None).await;
+        assert_eq!(len(&cli, 0).await.unwrap(), 0);
+        assert_resource_exhausted(
+            len(&cli, 1).await.unwrap_err(),
+            "received message larger than max (1 vs. 0)",
+        );
+
+        let cli = serve_bytes(Some(usize::MAX), None).await;
+        assert_eq!(len(&cli, 6 * MIB).await.unwrap(), 6 * MIB);
+    }
+
+    /// By default the server's response messages are not limited, and a
+    /// limit ends a response with `ResourceExhausted`.
+    #[tokio::test]
+    async fn response_size_limit() {
+        let mut cli = serve_bytes(None, None).await;
+        cli.set_max_decoding_message_size(usize::MAX);
+        assert_eq!(blob(&cli, 6 * MIB).await.unwrap(), 6 * MIB);
+
+        let cli = serve_bytes(None, Some(16)).await;
+        assert_eq!(blob(&cli, 16).await.unwrap(), 16);
+        assert_resource_exhausted(
+            blob(&cli, 17).await.unwrap_err(),
+            "trying to send message larger than max (17 vs. 16)",
+        );
+        let (lens, status) = blobs(&cli, 16).await;
+        assert_eq!(lens, [1, 16, 1]);
+        assert!(status.is_none());
+        let (lens, status) = blobs(&cli, 17).await;
+        assert_eq!(lens, [1]);
+        assert_resource_exhausted(
+            status.unwrap(),
+            "trying to send message larger than max (17 vs. 16)",
+        );
+    }
+
+    /// By default the client accepts a response message of up to 4 MiB, and
+    /// rejects a larger one without breaking the connection.
+    #[tokio::test]
+    async fn default_client_response_size_limit() {
+        let cli = serve_bytes(None, None).await;
+        assert_eq!(blob(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+        assert_resource_exhausted(
+            blob(&cli, 4 * MIB + 1).await.unwrap_err(),
+            "received message larger than max (4194305 vs. 4194304)",
+        );
+        let (lens, status) = blobs(&cli, 4 * MIB + 1).await;
+        assert_eq!(lens, [1]);
+        assert_resource_exhausted(
+            status.unwrap(),
+            "received message larger than max (4194305 vs. 4194304)",
+        );
+        assert_eq!(blob(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+        let (lens, status) = blobs(&cli, 4 * MIB).await;
+        assert_eq!(lens, [1, 4 * MIB, 1]);
+        assert!(status.is_none());
+    }
+
+    /// The client's limits on response and request messages can be set.
+    #[tokio::test]
+    async fn client_size_limits() {
+        let mut cli = serve_bytes(None, None).await;
+        cli.set_max_decoding_message_size(16);
+        assert_eq!(blob(&cli, 16).await.unwrap(), 16);
+        assert_resource_exhausted(
+            blob(&cli, 17).await.unwrap_err(),
+            "received message larger than max (17 vs. 16)",
+        );
+        let (lens, status) = blobs(&cli, 17).await;
+        assert_eq!(lens, [1]);
+        assert_resource_exhausted(
+            status.unwrap(),
+            "received message larger than max (17 vs. 16)",
+        );
+
+        cli.set_max_encoding_message_size(16);
+        assert_eq!(len(&cli, 16).await.unwrap(), 16);
+        assert_resource_exhausted(
+            len(&cli, 17).await.unwrap_err(),
+            "trying to send message larger than max (17 vs. 16)",
+        );
+        assert_eq!(total_len(&cli, &[16, 16]).await.unwrap(), 32);
+        assert_resource_exhausted(
+            total_len(&cli, &[16, 17, 16]).await.unwrap_err(),
+            "trying to send message larger than max (17 vs. 16)",
+        );
+    }
+
+    /// Over a connection too, compressed messages are limited by their size
+    /// once decompressed, in both directions, and by their compressed size
+    /// when sent.
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn compressed_message_size_limits() {
+        let gzip = CompressionEncoding::GZIP;
+        let mut cli = serve_compressed_bytes(None, None, Some(gzip)).await;
+        cli.set_send_compressed(gzip);
+        cli.set_accept_compressed([gzip]);
+
+        // 8 MiB of zeros are a few KiB once compressed.
+        assert_eq!(len(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+        assert_resource_exhausted(
+            len(&cli, 8 * MIB).await.unwrap_err(),
+            "received message after decompression larger than max (4194304)",
+        );
+        assert_eq!(blob(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+        assert_resource_exhausted(
+            blob(&cli, 8 * MIB).await.unwrap_err(),
+            "received message after decompression larger than max (4194304)",
+        );
+        let (lens, status) = blobs(&cli, 8 * MIB).await;
+        assert_eq!(lens, [1]);
+        assert_resource_exhausted(
+            status.unwrap(),
+            "received message after decompression larger than max (4194304)",
+        );
+        assert_eq!(len(&cli, 4 * MIB).await.unwrap(), 4 * MIB);
+
+        // 1 MiB of zeros is about 1 KiB once compressed.
+        cli.set_max_encoding_message_size(4096);
+        assert_eq!(len(&cli, MIB).await.unwrap(), MIB);
+        cli.set_max_encoding_message_size(64);
+        assert_eq!(
+            len(&cli, MIB).await.unwrap_err().code(),
+            Code::ResourceExhausted
+        );
     }
 }

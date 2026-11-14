@@ -104,6 +104,17 @@ impl CompressionEncoding {
         Ok(buf)
     }
 
+    /// Decompresses `data`, or returns `None` if that takes more than
+    /// `max_size` bytes, of which no more than one extra is produced.
+    pub(crate) async fn decode(&self, data: &[u8], max_size: usize) -> IoResult<Option<Vec<u8>>> {
+        // One byte more than allowed tells a message that is too large from
+        // one of exactly `max_size` bytes.
+        let limit = (max_size as u64).saturating_add(1);
+        let buf = self.decode_up_to(data, limit).await?;
+        Ok((buf.len() <= max_size).then_some(buf))
+    }
+
+    /// Decompresses the first `limit` bytes of `data`'s contents.
     #[allow(
         unreachable_code,
         unused_imports,
@@ -111,7 +122,7 @@ impl CompressionEncoding {
         unused_variables,
         unreachable_patterns
     )]
-    pub(crate) async fn decode(&self, data: &[u8]) -> IoResult<Vec<u8>> {
+    pub(crate) async fn decode_up_to(&self, data: &[u8], limit: u64) -> IoResult<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 
         let mut buf = Vec::new();
@@ -120,24 +131,28 @@ impl CompressionEncoding {
             #[cfg(feature = "gzip")]
             CompressionEncoding::GZIP => {
                 async_compression::tokio::bufread::GzipDecoder::new(data)
+                    .take(limit)
                     .read_to_end(&mut buf)
                     .await?;
             }
             #[cfg(feature = "deflate")]
             CompressionEncoding::DEFLATE => {
                 async_compression::tokio::bufread::DeflateDecoder::new(data)
+                    .take(limit)
                     .read_to_end(&mut buf)
                     .await?;
             }
             #[cfg(feature = "brotli")]
             CompressionEncoding::BROTLI => {
                 async_compression::tokio::bufread::BrotliDecoder::new(data)
+                    .take(limit)
                     .read_to_end(&mut buf)
                     .await?;
             }
             #[cfg(feature = "zstd")]
             CompressionEncoding::ZSTD => {
                 async_compression::tokio::bufread::ZstdDecoder::new(data)
+                    .take(limit)
                     .read_to_end(&mut buf)
                     .await?;
             }

@@ -1,5 +1,5 @@
 use std::{
-    io::{Error as IoError, Result as IoResult},
+    io::Error as IoError,
     sync::{Arc, Mutex},
 };
 
@@ -16,14 +16,26 @@ use crate::{
     codec::{Decoder, Encoder},
 };
 
+/// The default limit on the size of a received message, as in the other gRPC
+/// implementations.
+pub(crate) const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// The default limit on the size of a sent message: none, besides the 4 GiB
+/// its length prefix can describe.
+pub(crate) const DEFAULT_MAX_ENCODING_MESSAGE_SIZE: usize = usize::MAX;
+
+/// Encodes `message` into a length-prefixed message of at most `max_size`
+/// bytes, not counting the prefix. The limit applies to the bytes sent, i.e.
+/// after compression.
 async fn encode_data_frame<T: Encoder>(
     encoder: &mut T,
     buf: &mut BytesMut,
     message: T::Item,
     compression: Option<CompressionEncoding>,
-) -> IoResult<Bytes> {
+    max_size: usize,
+) -> Result<Bytes, Status> {
     let Some(compression) = compression else {
-        return encode_uncompressed_data_frame(encoder, buf, message);
+        return encode_uncompressed_data_frame(encoder, buf, message, max_size);
     };
 
     buf.put_slice(&[1, 0, 0, 0, 0]);
@@ -35,12 +47,12 @@ async fn encode_data_frame<T: Encoder>(
     match res {
         Ok(data) => {
             buf.extend(data);
-            Ok(finish_data_frame(buf))
+            finish_data_frame(buf, max_size)
         }
         Err(err) => {
             // Don't leave this frame's header in front of the next one.
             buf.clear();
-            Err(err)
+            Err(Status::from_std_error(err))
         }
     }
 }
@@ -49,34 +61,48 @@ fn encode_uncompressed_data_frame<T: Encoder>(
     encoder: &mut T,
     buf: &mut BytesMut,
     message: T::Item,
-) -> IoResult<Bytes> {
+    max_size: usize,
+) -> Result<Bytes, Status> {
     buf.put_slice(&[0, 0, 0, 0, 0]);
     if let Err(err) = encoder.encode(message, buf) {
         // Don't leave this frame's header, or part of the message, in front of
         // the next one.
         buf.clear();
-        return Err(err);
+        return Err(Status::from_std_error(err));
     }
-    Ok(finish_data_frame(buf))
+    finish_data_frame(buf, max_size)
 }
 
-fn finish_data_frame(buf: &mut BytesMut) -> Bytes {
-    let msg_len = (buf.len() - 5) as u32;
-    buf.as_mut()[1..5].copy_from_slice(&msg_len.to_be_bytes());
-    buf.split().freeze()
+fn finish_data_frame(buf: &mut BytesMut, max_size: usize) -> Result<Bytes, Status> {
+    let msg_len = buf.len() - 5;
+    // The length prefix is 4 bytes, whatever the limit.
+    let max_size = max_size.min(u32::MAX as usize);
+    if msg_len > max_size {
+        // Don't leave this message in front of the next one.
+        buf.clear();
+        return Err(Status::new(Code::ResourceExhausted).with_message(format!(
+            "trying to send message larger than max ({msg_len} vs. {max_size})"
+        )));
+    }
+    buf.as_mut()[1..5].copy_from_slice(&(msg_len as u32).to_be_bytes());
+    Ok(buf.split().freeze())
 }
 
 struct DataFrameDecoder {
     buf: BytesMut,
     compression: Option<CompressionEncoding>,
+    max_size: usize,
 }
 
 impl DataFrameDecoder {
+    /// Creates a decoder of length-prefixed messages of at most `max_size`
+    /// bytes, both as received and once decompressed.
     #[inline]
-    fn new(compression: Option<CompressionEncoding>) -> Self {
+    fn new(compression: Option<CompressionEncoding>, max_size: usize) -> Self {
         Self {
             buf: BytesMut::new(),
             compression,
+            max_size,
         }
     }
 
@@ -105,8 +131,17 @@ impl DataFrameDecoder {
                 .with_message(format!("unsupported compressed flag: {compressed}")))?,
         };
 
+        // Checked as soon as the prefix is read, so no more than `max_size`
+        // bytes, plus the frame they end in, are ever buffered for a message.
         let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
-        if self.buf.len() >= len + 5 {
+        if len > self.max_size {
+            return Err(Status::new(Code::ResourceExhausted).with_message(format!(
+                "received message larger than max ({len} vs. {})",
+                self.max_size
+            )));
+        }
+
+        if self.buf.len() - 5 >= len {
             self.buf.advance(5);
             let data = self.buf.split_to(len).freeze();
 
@@ -116,9 +151,15 @@ impl DataFrameDecoder {
                         .with_message(format!("unsupported compressed flag: {compressed}"))
                 })?;
                 let data = compression
-                    .decode(&data)
+                    .decode(&data, self.max_size)
                     .await
-                    .map_err(|err| Status::new(Code::Internal).with_message(err.to_string()))?;
+                    .map_err(|err| Status::new(Code::Internal).with_message(err.to_string()))?
+                    .ok_or_else(|| {
+                        Status::new(Code::ResourceExhausted).with_message(format!(
+                            "received message after decompression larger than max ({})",
+                            self.max_size
+                        ))
+                    })?;
                 Ok(Some(data.into()))
             } else {
                 Ok(Some(data))
@@ -133,11 +174,12 @@ pub(crate) fn create_decode_request_body<T: Decoder>(
     mut decoder: T,
     body: Body,
     compression: Option<CompressionEncoding>,
+    max_message_size: usize,
 ) -> Streaming<T::Item> {
     let mut body: BoxBody = body.into();
 
     Streaming::new(async_stream::try_stream! {
-        let mut frame_decoder = DataFrameDecoder::new(compression);
+        let mut frame_decoder = DataFrameDecoder::new(compression, max_message_size);
 
         loop {
             match body.frame().await.transpose().map_err(Status::from_std_error)? {
@@ -169,6 +211,7 @@ pub(crate) fn create_encode_response_body<T: Encoder>(
     mut encoder: T,
     mut stream: Streaming<T::Item>,
     compression: Option<CompressionEncoding>,
+    max_message_size: usize,
 ) -> Body {
     let stream = async_stream::stream! {
         let mut buf = BytesMut::new();
@@ -176,9 +219,10 @@ pub(crate) fn create_encode_response_body<T: Encoder>(
 
         while let Some(item) = stream.next().await {
             let res = match item {
-                Ok(message) => encode_data_frame(&mut encoder, &mut buf, message, compression)
-                    .await
-                    .map_err(Status::from_std_error),
+                Ok(message) => {
+                    encode_data_frame(&mut encoder, &mut buf, message, compression, max_message_size)
+                        .await
+                }
                 Err(err) => Err(err),
             };
             match res {
@@ -222,6 +266,7 @@ pub(crate) fn create_encode_request_body<T: Encoder>(
     mut encoder: T,
     mut stream: Streaming<T::Item>,
     compression: Option<CompressionEncoding>,
+    max_message_size: usize,
     error: RequestError,
 ) -> Body {
     let stream = async_stream::stream! {
@@ -230,12 +275,12 @@ pub(crate) fn create_encode_request_body<T: Encoder>(
         while let Some(item) = stream.next().await {
             let status = match item {
                 Ok(message) => {
-                    match encode_data_frame(&mut encoder, &mut buf, message, compression).await {
+                    match encode_data_frame(&mut encoder, &mut buf, message, compression, max_message_size).await {
                         Ok(data) => {
                             yield Ok(Frame::data(data));
                             continue;
                         }
-                        Err(err) => Status::from_std_error(err),
+                        Err(status) => status,
                     }
                 }
                 Err(status) => status,
@@ -256,6 +301,7 @@ pub(crate) async fn create_encode_unary_request_body<T: Encoder>(
     mut encoder: T,
     message: T::Item,
     compression: Option<CompressionEncoding>,
+    max_message_size: usize,
 ) -> Result<Body, Status> {
     let mut buf = BytesMut::new();
     let data = match compression {
@@ -266,12 +312,12 @@ pub(crate) async fn create_encode_unary_request_body<T: Encoder>(
                 &mut buf,
                 message,
                 compression,
+                max_message_size,
             ))
             .await
         }
-        None => encode_uncompressed_data_frame(&mut encoder, &mut buf, message),
-    }
-    .map_err(Status::from_std_error)?;
+        None => encode_uncompressed_data_frame(&mut encoder, &mut buf, message, max_message_size),
+    }?;
     Ok(Body::from_bytes(data))
 }
 
@@ -307,6 +353,7 @@ pub(crate) async fn decode_single_response_message<T: Decoder>(
     headers: &HeaderMap,
     body: Body,
     compression: Option<CompressionEncoding>,
+    max_message_size: usize,
 ) -> Result<T::Item, Status> {
     // check is trailers-only
     if let Some(status) = Status::from_headers(headers)? {
@@ -318,7 +365,7 @@ pub(crate) async fn decode_single_response_message<T: Decoder>(
     }
 
     let mut body: BoxBody = body.into();
-    let mut frame_decoder = DataFrameDecoder::new(compression);
+    let mut frame_decoder = DataFrameDecoder::new(compression, max_message_size);
     let mut result: Option<Result<T::Item, Status>> = None;
     let mut discarded = 0;
 
@@ -400,6 +447,7 @@ pub(crate) fn create_decode_response_body<T: Decoder>(
     headers: &HeaderMap,
     body: Body,
     compression: Option<CompressionEncoding>,
+    max_message_size: usize,
 ) -> Result<Streaming<T::Item>, Status> {
     // check is trailers-only
     if let Some(status) = Status::from_headers(headers)? {
@@ -413,7 +461,7 @@ pub(crate) fn create_decode_response_body<T: Decoder>(
     let mut body: BoxBody = body.into();
 
     Ok(Streaming::new(async_stream::try_stream! {
-        let mut frame_decoder = DataFrameDecoder::new(compression);
+        let mut frame_decoder = DataFrameDecoder::new(compression, max_message_size);
         let mut status = None;
 
         while let Some(frame) = body.frame().await.transpose().map_err(Status::from_std_error)? {
@@ -442,6 +490,8 @@ pub(crate) fn create_decode_response_body<T: Decoder>(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Result as IoResult;
+
     use futures_util::TryStreamExt;
     use http::HeaderMap;
     use prost::Message;
@@ -481,9 +531,14 @@ mod tests {
         let body = Body::from_bytes_stream(bytes_stream);
 
         let mut codec = ProstCodec::<TestMsg, TestMsg>::default();
-        let mut streaming =
-            create_decode_response_body(codec.decoder(), &HeaderMap::default(), body, None)
-                .expect("streaming");
+        let mut streaming = create_decode_response_body(
+            codec.decoder(),
+            &HeaderMap::default(),
+            body,
+            None,
+            usize::MAX,
+        )
+        .expect("streaming");
 
         let stream_msg = streaming
             .try_next()
@@ -533,12 +588,12 @@ mod tests {
     async fn failed_encode_leaves_no_bytes() {
         let mut buf = BytesMut::new();
         assert!(
-            encode_data_frame(&mut I32Encoder, &mut buf, -1, None)
+            encode_data_frame(&mut I32Encoder, &mut buf, -1, None, usize::MAX)
                 .await
                 .is_err()
         );
         assert!(buf.is_empty());
-        let frame = encode_data_frame(&mut I32Encoder, &mut buf, 2, None).await;
+        let frame = encode_data_frame(&mut I32Encoder, &mut buf, 2, None, usize::MAX).await;
         assert_eq!(frame.unwrap(), i32_frame(2));
     }
 
@@ -549,12 +604,12 @@ mod tests {
         let gzip = Some(CompressionEncoding::GZIP);
         let mut buf = BytesMut::new();
         assert!(
-            encode_data_frame(&mut I32Encoder, &mut buf, -1, gzip)
+            encode_data_frame(&mut I32Encoder, &mut buf, -1, gzip, usize::MAX)
                 .await
                 .is_err()
         );
         assert!(buf.is_empty());
-        let frame = encode_data_frame(&mut I32Encoder, &mut buf, 2, gzip)
+        let frame = encode_data_frame(&mut I32Encoder, &mut buf, 2, gzip, usize::MAX)
             .await
             .unwrap();
         assert_eq!(frame[0], 1);
@@ -562,8 +617,11 @@ mod tests {
             u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize,
             frame.len() - 5
         );
-        let data = CompressionEncoding::GZIP.decode(&frame[5..]).await.unwrap();
-        assert_eq!(data, 2i32.to_be_bytes());
+        let data = CompressionEncoding::GZIP
+            .decode(&frame[5..], usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(data.unwrap(), 2i32.to_be_bytes());
     }
 
     fn grpc_status(frame: &IoResult<Frame<Bytes>>) -> (&str, Option<&str>) {
@@ -580,7 +638,13 @@ mod tests {
     #[tokio::test]
     async fn response_ends_with_ok_trailers() {
         let stream = Streaming::new(futures_util::stream::iter([Ok(1), Ok(2)]));
-        let frames = frames(create_encode_response_body(I32Encoder, stream, None)).await;
+        let frames = frames(create_encode_response_body(
+            I32Encoder,
+            stream,
+            None,
+            usize::MAX,
+        ))
+        .await;
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].as_ref().unwrap().data_ref(), Some(&i32_frame(1)));
         assert_eq!(frames[1].as_ref().unwrap().data_ref(), Some(&i32_frame(2)));
@@ -592,7 +656,13 @@ mod tests {
     #[tokio::test]
     async fn failed_encode_ends_response_with_status() {
         let stream = Streaming::new(futures_util::stream::iter([Ok(1), Ok(-1), Ok(2)]));
-        let frames = frames(create_encode_response_body(I32Encoder, stream, None)).await;
+        let frames = frames(create_encode_response_body(
+            I32Encoder,
+            stream,
+            None,
+            usize::MAX,
+        ))
+        .await;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].as_ref().unwrap().data_ref(), Some(&i32_frame(1)));
         assert_eq!(grpc_status(&frames[1]), ("13", Some("negative")));
@@ -613,7 +683,13 @@ mod tests {
                 }
             }),
         ));
-        let frames = frames(create_encode_response_body(I32Encoder, stream, None)).await;
+        let frames = frames(create_encode_response_body(
+            I32Encoder,
+            stream,
+            None,
+            usize::MAX,
+        ))
+        .await;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].as_ref().unwrap().data_ref(), Some(&i32_frame(1)));
         assert_eq!(grpc_status(&frames[1]), ("5", Some("gone")));
@@ -629,6 +705,7 @@ mod tests {
             I32Encoder,
             stream,
             None,
+            usize::MAX,
             error.clone(),
         ))
         .await;
@@ -636,5 +713,233 @@ mod tests {
         assert_eq!(frames[0].as_ref().unwrap().data_ref(), Some(&i32_frame(1)));
         assert!(frames[1].is_err());
         assert_eq!(error.get().unwrap().code(), Code::Internal);
+    }
+
+    fn assert_resource_exhausted<T: std::fmt::Debug>(res: Result<T, Status>, message: &str) {
+        let status = res.unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.message(), Some(message));
+    }
+
+    /// A message of exactly the limit is sent, a larger one is not, and
+    /// leaves nothing in the buffer shared with the next one.
+    #[tokio::test]
+    async fn encoded_message_size_limit() {
+        let mut buf = BytesMut::new();
+        let frame = encode_data_frame(&mut I32Encoder, &mut buf, 1, None, 4).await;
+        assert_eq!(frame.unwrap(), i32_frame(1));
+
+        let res = encode_data_frame(&mut I32Encoder, &mut buf, 1, None, 3).await;
+        assert_resource_exhausted(res, "trying to send message larger than max (4 vs. 3)");
+        assert!(buf.is_empty());
+
+        let res = encode_uncompressed_data_frame(&mut I32Encoder, &mut buf, 1, 3);
+        assert_resource_exhausted(res, "trying to send message larger than max (4 vs. 3)");
+        assert!(buf.is_empty());
+    }
+
+    /// A message over the limit ends a response with `ResourceExhausted`.
+    #[tokio::test]
+    async fn oversized_message_ends_response_with_status() {
+        let stream = Streaming::new(futures_util::stream::iter([Ok(1), Ok(2)]));
+        let frames = frames(create_encode_response_body(I32Encoder, stream, None, 3)).await;
+        assert_eq!(frames.len(), 1);
+        let trailers = frames[0].as_ref().unwrap().trailers_ref().unwrap();
+        assert_resource_exhausted::<()>(
+            Err(Status::from_headers(trailers).unwrap().unwrap()),
+            "trying to send message larger than max (4 vs. 3)",
+        );
+    }
+
+    /// A message over the limit ends a streaming request with an error.
+    #[tokio::test]
+    async fn oversized_message_ends_request_with_error() {
+        let stream = Streaming::new(futures_util::stream::iter([Ok(1), Ok(2)]));
+        let error = RequestError::default();
+        let frames = frames(create_encode_request_body(
+            I32Encoder,
+            stream,
+            None,
+            3,
+            error.clone(),
+        ))
+        .await;
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_err());
+        assert_eq!(error.get().unwrap().code(), Code::ResourceExhausted);
+    }
+
+    /// A message of exactly the limit is received.
+    #[tokio::test]
+    async fn decoded_message_at_size_limit() {
+        let mut decoder = DataFrameDecoder::new(None, 4);
+        decoder.put_slice(i32_frame(1));
+        assert_eq!(
+            decoder.next().await.unwrap().unwrap(),
+            &1i32.to_be_bytes()[..]
+        );
+        assert!(decoder.check_incomplete().is_ok());
+    }
+
+    /// A message over the limit is rejected from its length prefix alone,
+    /// before any of it is buffered.
+    #[tokio::test]
+    async fn decoded_message_over_size_limit() {
+        let mut decoder = DataFrameDecoder::new(None, 3);
+        decoder.put_slice([0, 0, 0, 0]);
+        assert!(decoder.next().await.unwrap().is_none());
+        decoder.put_slice([4]);
+        assert_resource_exhausted(
+            decoder.next().await,
+            "received message larger than max (4 vs. 3)",
+        );
+
+        // The largest length a prefix can announce.
+        let mut decoder = DataFrameDecoder::new(None, DEFAULT_MAX_DECODING_MESSAGE_SIZE);
+        decoder.put_slice([0, 0xff, 0xff, 0xff, 0xff]);
+        assert_resource_exhausted(
+            decoder.next().await,
+            "received message larger than max (4294967295 vs. 4194304)",
+        );
+    }
+
+    /// Without a limit, the largest length a prefix can announce is waited
+    /// for, also where `usize` is 32 bits.
+    #[tokio::test]
+    async fn decoded_message_without_size_limit() {
+        let mut decoder = DataFrameDecoder::new(None, usize::MAX);
+        decoder.put_slice([0, 0xff, 0xff, 0xff, 0xff, 1, 2, 3]);
+        assert!(decoder.next().await.unwrap().is_none());
+    }
+
+    /// An oversized message ends the stream of decoded requests and of
+    /// decoded responses with `ResourceExhausted`, after the messages before
+    /// it.
+    #[tokio::test]
+    async fn oversized_message_ends_decoded_streams() {
+        fn body() -> Body {
+            let mut data = BytesMut::new();
+            data.extend(i32_frame(1));
+            data.put_slice(&[0, 0, 0, 0, 5, 1, 2, 3, 4, 5]);
+            data.extend(i32_frame(2));
+            Body::from_bytes(data.freeze())
+        }
+
+        struct I32Decoder;
+
+        impl Decoder for I32Decoder {
+            type Item = i32;
+
+            fn decode(&mut self, mut buf: &[u8]) -> IoResult<i32> {
+                Ok(buf.get_i32())
+            }
+        }
+
+        let mut requests = create_decode_request_body(I32Decoder, body(), None, 4);
+        assert_eq!(requests.try_next().await.unwrap(), Some(1));
+        assert_resource_exhausted(
+            requests.try_next().await,
+            "received message larger than max (5 vs. 4)",
+        );
+        assert!(requests.next().await.is_none());
+
+        let mut responses =
+            create_decode_response_body(I32Decoder, &HeaderMap::default(), body(), None, 4)
+                .unwrap();
+        assert_eq!(responses.try_next().await.unwrap(), Some(1));
+        assert_resource_exhausted(
+            responses.try_next().await,
+            "received message larger than max (5 vs. 4)",
+        );
+        assert!(responses.next().await.is_none());
+
+        let res =
+            decode_single_response_message(I32Decoder, &HeaderMap::default(), body(), None, 3)
+                .await;
+        assert_resource_exhausted(res, "received message larger than max (4 vs. 3)");
+    }
+
+    #[cfg(feature = "gzip")]
+    mod compressed {
+        use super::*;
+
+        /// Encodes and decodes a message as its bytes.
+        struct BytesCodec;
+
+        impl Encoder for BytesCodec {
+            type Item = Vec<u8>;
+
+            fn encode(&mut self, message: Vec<u8>, buf: &mut BytesMut) -> IoResult<()> {
+                buf.put_slice(&message);
+                Ok(())
+            }
+        }
+
+        const GZIP: Option<CompressionEncoding> = Some(CompressionEncoding::GZIP);
+
+        /// 1 MiB of zeros, which gzip compresses to about 1 KiB.
+        fn zeros() -> Vec<u8> {
+            vec![0; 1024 * 1024]
+        }
+
+        async fn compressed_frame(message: Vec<u8>) -> Bytes {
+            let mut buf = BytesMut::new();
+            encode_data_frame(&mut BytesCodec, &mut buf, message, GZIP, usize::MAX)
+                .await
+                .unwrap()
+        }
+
+        /// The limit on a sent message applies to its compressed bytes.
+        #[tokio::test]
+        async fn encoded_size_limit_is_after_compression() {
+            let frame = compressed_frame(zeros()).await;
+            let compressed_len = frame.len() - 5;
+            assert!(compressed_len < 4096, "{compressed_len}");
+
+            let mut buf = BytesMut::new();
+            let res =
+                encode_data_frame(&mut BytesCodec, &mut buf, zeros(), GZIP, compressed_len).await;
+            assert_eq!(res.unwrap(), frame);
+
+            let res =
+                encode_data_frame(&mut BytesCodec, &mut buf, zeros(), GZIP, compressed_len - 1)
+                    .await;
+            assert_eq!(res.unwrap_err().code(), Code::ResourceExhausted);
+            assert!(buf.is_empty());
+        }
+
+        /// A small compressed message that decompresses to more than the
+        /// limit is rejected; one that decompresses to exactly the limit is
+        /// not.
+        #[tokio::test]
+        async fn decoded_size_limit_is_after_decompression() {
+            let frame = compressed_frame(zeros()).await;
+
+            let mut decoder = DataFrameDecoder::new(GZIP, 1024 * 1024);
+            decoder.put_slice(&frame);
+            assert_eq!(decoder.next().await.unwrap().unwrap(), zeros());
+
+            let mut decoder = DataFrameDecoder::new(GZIP, 1024 * 1024 - 1);
+            decoder.put_slice(&frame);
+            assert_resource_exhausted(
+                decoder.next().await,
+                "received message after decompression larger than max (1048575)",
+            );
+        }
+
+        /// Decompression stops one byte past the limit, instead of producing
+        /// the whole message before measuring it.
+        #[tokio::test]
+        async fn decompression_stops_at_size_limit() {
+            let frame = compressed_frame(zeros()).await;
+            let data = &frame[5..];
+            let gzip = CompressionEncoding::GZIP;
+            assert_eq!(gzip.decode(data, usize::MAX).await.unwrap(), Some(zeros()));
+            assert_eq!(gzip.decode(data, 1024 * 1024).await.unwrap(), Some(zeros()));
+            assert_eq!(gzip.decode(data, 100).await.unwrap(), None);
+            assert_eq!(gzip.decode(data, 0).await.unwrap(), None);
+            // What rejecting it at a limit of 100 bytes produced.
+            assert_eq!(gzip.decode_up_to(data, 101).await.unwrap(), [0; 101]);
+        }
     }
 }

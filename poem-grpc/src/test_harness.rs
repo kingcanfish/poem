@@ -302,4 +302,129 @@ mod tests {
             assert_eq!(resp.metadata().get("x-method-type"), Some("unary"));
         }
     }
+
+    fn create_cli_with(server: TestHarnessServer<TestHarnessService>) -> TestHarnessClient {
+        TestHarnessClient::from_endpoint(RouteGrpc::new().add_service(server))
+    }
+
+    fn assert_resource_exhausted<T>(res: Result<T, Status>, message: &str) {
+        let status = res.err().expect("the call succeeded");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.message(), Some(message));
+    }
+
+    fn values(values: &[i32]) -> Request<Streaming<ValueRequest>> {
+        let values: Vec<_> = values
+            .iter()
+            .map(|value| Ok(ValueRequest { value: *value }))
+            .collect();
+        Request::new_streaming(futures_util::stream::iter(values))
+    }
+
+    // `ValueRequest { value: 5 }` and `ValueResponse { value: 5 }` encode to 2
+    // bytes, `UnaryRequest { a: 10, b: 20 }` to 4.
+
+    /// A generated server limits the request messages of every kind of
+    /// method.
+    #[tokio::test]
+    async fn server_max_decoding_message_size() {
+        let server = || TestHarnessServer::new(TestHarnessService);
+        let request = || Request::new(UnaryRequest { a: 10, b: 20 });
+
+        let cli = create_cli_with(server().max_decoding_message_size(4));
+        assert_eq!(cli.unary(request()).await.unwrap().into_inner().value, 30);
+
+        let cli = create_cli_with(server().max_decoding_message_size(2));
+        let resp = cli.client_streaming(values(&[5, 6])).await.unwrap();
+        assert_eq!(resp.into_inner().value, 11);
+        let message = "received message larger than max (4 vs. 2)";
+        assert_resource_exhausted(cli.unary(request()).await, message);
+        assert_resource_exhausted(cli.unary_metadata(request()).await, message);
+
+        let cli = create_cli_with(server().max_decoding_message_size(1));
+        let message = "received message larger than max (2 vs. 1)";
+        assert_resource_exhausted(cli.client_streaming(values(&[5])).await, message);
+        assert_resource_exhausted(
+            cli.server_streaming(Request::new(ValueRequest { value: 5 }))
+                .await,
+            message,
+        );
+        let mut responses = cli
+            .bidirectional_streaming(values(&[5]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_resource_exhausted(responses.try_next().await, message);
+    }
+
+    /// A generated server limits the response messages of every kind of
+    /// method.
+    #[tokio::test]
+    async fn server_max_encoding_message_size() {
+        let server = || TestHarnessServer::new(TestHarnessService);
+        let request = || Request::new(UnaryRequest { a: 10, b: 20 });
+
+        let cli = create_cli_with(server().max_encoding_message_size(2));
+        assert_eq!(cli.unary(request()).await.unwrap().into_inner().value, 30);
+
+        let cli = create_cli_with(server().max_encoding_message_size(1));
+        let message = "trying to send message larger than max (2 vs. 1)";
+        assert_resource_exhausted(cli.unary(request()).await, message);
+        assert_resource_exhausted(cli.client_streaming(values(&[5])).await, message);
+        let mut responses = cli
+            .server_streaming(Request::new(ValueRequest { value: 5 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_resource_exhausted(responses.try_next().await, message);
+        let mut responses = cli
+            .bidirectional_streaming(values(&[5]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_resource_exhausted(responses.try_next().await, message);
+    }
+
+    /// A generated client limits the messages it sends and receives.
+    #[tokio::test]
+    async fn client_message_size_limits() {
+        let request = || Request::new(UnaryRequest { a: 10, b: 20 });
+
+        let mut cli = create_cli();
+        cli.set_max_decoding_message_size(2);
+        cli.set_max_encoding_message_size(4);
+        assert_eq!(cli.unary(request()).await.unwrap().into_inner().value, 30);
+
+        cli.set_max_decoding_message_size(1);
+        let message = "received message larger than max (2 vs. 1)";
+        assert_resource_exhausted(cli.unary(request()).await, message);
+        assert_resource_exhausted(cli.client_streaming(values(&[5])).await, message);
+        let mut responses = cli
+            .server_streaming(Request::new(ValueRequest { value: 5 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_resource_exhausted(responses.try_next().await, message);
+
+        let mut cli = create_cli();
+        cli.set_max_encoding_message_size(3);
+        assert_resource_exhausted(
+            cli.unary(request()).await,
+            "trying to send message larger than max (4 vs. 3)",
+        );
+        cli.set_max_encoding_message_size(1);
+        let message = "trying to send message larger than max (2 vs. 1)";
+        assert_resource_exhausted(cli.client_streaming(values(&[5])).await, message);
+        assert_resource_exhausted(
+            cli.server_streaming(Request::new(ValueRequest { value: 5 }))
+                .await,
+            message,
+        );
+        let mut responses = cli
+            .bidirectional_streaming(values(&[5]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_resource_exhausted(responses.try_next().await, message);
+    }
 }

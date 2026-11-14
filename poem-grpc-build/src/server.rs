@@ -129,6 +129,8 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
             inner: ::std::sync::Arc<T>,
             send_compressed: ::std::option::Option<#crate_name::CompressionEncoding>,
             accept_compressed: ::std::sync::Arc<[#crate_name::CompressionEncoding]>,
+            max_decoding_message_size: ::std::option::Option<usize>,
+            max_encoding_message_size: ::std::option::Option<usize>,
         }
 
         impl<T> ::std::clone::Clone for #server_ident<T> {
@@ -138,6 +140,8 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
                     inner: self.inner.clone(),
                     send_compressed: self.send_compressed,
                     accept_compressed: self.accept_compressed.clone(),
+                    max_decoding_message_size: self.max_decoding_message_size,
+                    max_encoding_message_size: self.max_encoding_message_size,
                 }
             }
         }
@@ -158,6 +162,8 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
                     inner: ::std::sync::Arc::new(service),
                     send_compressed: ::std::option::Option::None,
                     accept_compressed: ::std::sync::Arc::new([]),
+                    max_decoding_message_size: ::std::option::Option::None,
+                    max_encoding_message_size: ::std::option::Option::None,
                 }
             }
 
@@ -173,6 +179,31 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
             pub fn accept_compressed(self, encodings: impl ::std::convert::Into<::std::sync::Arc<[#crate_name::CompressionEncoding]>>) -> Self {
                 Self {
                     accept_compressed: encodings.into(),
+                    ..self
+                }
+            }
+
+            /// Limits the size of a request message, in bytes. A larger one
+            /// fails the call with `ResourceExhausted`, without being read
+            /// in whole. A compressed message is limited both as received
+            /// and once decompressed.
+            ///
+            /// Default is 4 MiB. `usize::MAX` removes the limit.
+            pub fn max_decoding_message_size(self, limit: usize) -> Self {
+                Self {
+                    max_decoding_message_size: ::std::option::Option::Some(limit),
+                    ..self
+                }
+            }
+
+            /// Limits the size of a response message, in bytes, as sent,
+            /// i.e. after compression. A larger one ends the response with
+            /// `ResourceExhausted`.
+            ///
+            /// Default is no limit.
+            pub fn max_encoding_message_size(self, limit: usize) -> Self {
+                Self {
+                    max_encoding_message_size: ::std::option::Option::Some(limit),
                     ..self
                 }
             }
@@ -256,7 +287,7 @@ fn generate_unary(codec_list: &[Path], method_info: MethodInfo) -> TokenStream {
         crate_name,
         codec_list,
         quote! {
-            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).unary(#proxy_service_ident(server.inner.clone()), req).await
+            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).max_decoding_message_size(server.max_decoding_message_size).max_encoding_message_size(server.max_encoding_message_size).unary(#proxy_service_ident(server.inner.clone()), req).await
         },
     );
 
@@ -300,7 +331,7 @@ fn generate_client_streaming(codec_list: &[Path], method_info: MethodInfo) -> To
         crate_name,
         codec_list,
         quote! {
-            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).client_streaming(#proxy_service_ident(server.inner.clone()), req).await
+            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).max_decoding_message_size(server.max_decoding_message_size).max_encoding_message_size(server.max_encoding_message_size).client_streaming(#proxy_service_ident(server.inner.clone()), req).await
         },
     );
 
@@ -344,7 +375,7 @@ fn generate_server_streaming(codec_list: &[Path], method_info: MethodInfo) -> To
         crate_name,
         codec_list,
         quote! {
-            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).server_streaming(#proxy_service_ident(server.inner.clone()), req).await
+            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).max_decoding_message_size(server.max_decoding_message_size).max_encoding_message_size(server.max_encoding_message_size).server_streaming(#proxy_service_ident(server.inner.clone()), req).await
         },
     );
 
@@ -388,7 +419,7 @@ fn generate_bidirectional_streaming(codec_list: &[Path], method_info: MethodInfo
         crate_name,
         codec_list,
         quote! {
-            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).bidirectional_streaming(#proxy_service_ident(server.inner.clone()), req).await
+            #crate_name::server::GrpcServer::new(codec, server.send_compressed, &server.accept_compressed).max_decoding_message_size(server.max_decoding_message_size).max_encoding_message_size(server.max_encoding_message_size).bidirectional_streaming(#proxy_service_ident(server.inner.clone()), req).await
         },
     );
 

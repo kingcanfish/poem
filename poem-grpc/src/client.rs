@@ -22,8 +22,9 @@ use crate::{
     compression::get_incoming_encodings,
     connector::HttpsConnector,
     encoding::{
-        RequestError, create_decode_response_body, create_encode_request_body,
-        create_encode_unary_request_body, decode_single_response_message, discard_body,
+        DEFAULT_MAX_DECODING_MESSAGE_SIZE, DEFAULT_MAX_ENCODING_MESSAGE_SIZE, RequestError,
+        create_decode_response_body, create_encode_request_body, create_encode_unary_request_body,
+        decode_single_response_message, discard_body,
     },
 };
 
@@ -215,6 +216,8 @@ pub struct GrpcClient {
     ep: Arc<dyn DynEndpoint<Output = HttpResponse> + 'static>,
     send_compressed: Option<CompressionEncoding>,
     accept_compressed: Arc<[CompressionEncoding]>,
+    max_decoding_message_size: usize,
+    max_encoding_message_size: usize,
 }
 
 impl GrpcClient {
@@ -224,6 +227,8 @@ impl GrpcClient {
             ep: create_client_endpoint(config),
             send_compressed: None,
             accept_compressed: Arc::new([]),
+            max_decoding_message_size: DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+            max_encoding_message_size: DEFAULT_MAX_ENCODING_MESSAGE_SIZE,
         }
     }
 
@@ -244,6 +249,8 @@ impl GrpcClient {
             ep: Arc::new(ToDynEndpoint(ep.map_to_response())),
             send_compressed: None,
             accept_compressed: Arc::new([]),
+            max_decoding_message_size: DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+            max_encoding_message_size: DEFAULT_MAX_ENCODING_MESSAGE_SIZE,
         }
     }
 
@@ -253,6 +260,14 @@ impl GrpcClient {
 
     pub fn set_accept_compressed(&mut self, encodings: impl Into<Arc<[CompressionEncoding]>>) {
         self.accept_compressed = encodings.into();
+    }
+
+    pub fn set_max_decoding_message_size(&mut self, limit: usize) {
+        self.max_decoding_message_size = limit;
+    }
+
+    pub fn set_max_encoding_message_size(&mut self, limit: usize) {
+        self.max_encoding_message_size = limit;
     }
 
     pub fn with<M>(mut self, middleware: M) -> Self
@@ -285,8 +300,13 @@ impl GrpcClient {
             self.send_compressed,
         );
         http_request.set_body(
-            create_encode_unary_request_body(codec.encoder(), message, self.send_compressed)
-                .await?,
+            create_encode_unary_request_body(
+                codec.encoder(),
+                message,
+                self.send_compressed,
+                self.max_encoding_message_size,
+            )
+            .await?,
         );
 
         let mut resp = self.ep.call(http_request).await.map_err(call_error)?;
@@ -298,6 +318,7 @@ impl GrpcClient {
             resp.headers(),
             body,
             incoming_encoding,
+            self.max_decoding_message_size,
         )
         .await?;
         Ok(Response {
@@ -331,6 +352,7 @@ impl GrpcClient {
             codec.encoder(),
             message,
             self.send_compressed,
+            self.max_encoding_message_size,
             request_error.clone(),
         ));
 
@@ -344,6 +366,7 @@ impl GrpcClient {
                 resp.headers(),
                 body,
                 incoming_encoding,
+                self.max_decoding_message_size,
             )
             .await?;
             Ok(Response {
@@ -378,16 +401,26 @@ impl GrpcClient {
             self.send_compressed,
         );
         http_request.set_body(
-            create_encode_unary_request_body(codec.encoder(), message, self.send_compressed)
-                .await?,
+            create_encode_unary_request_body(
+                codec.encoder(),
+                message,
+                self.send_compressed,
+                self.max_encoding_message_size,
+            )
+            .await?,
         );
 
         let mut resp = self.ep.call(http_request).await.map_err(call_error)?;
 
         let incoming_encoding = check_response(&mut resp, &self.accept_compressed).await?;
         let body = resp.take_body();
-        let stream =
-            create_decode_response_body(codec.decoder(), resp.headers(), body, incoming_encoding)?;
+        let stream = create_decode_response_body(
+            codec.decoder(),
+            resp.headers(),
+            body,
+            incoming_encoding,
+            self.max_decoding_message_size,
+        )?;
 
         Ok(Response {
             metadata: Metadata {
@@ -420,6 +453,7 @@ impl GrpcClient {
             codec.encoder(),
             message,
             self.send_compressed,
+            self.max_encoding_message_size,
             request_error.clone(),
         ));
 
@@ -433,6 +467,7 @@ impl GrpcClient {
                 resp.headers(),
                 body,
                 incoming_encoding,
+                self.max_decoding_message_size,
             )?;
 
             Ok(Response {

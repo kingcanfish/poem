@@ -127,6 +127,29 @@ pub(crate) fn generate(config: &GrpcConfig, service: &Service, buf: &mut String)
                 self.cli.set_accept_compressed(encodings);
             }
 
+            /// Limits the size of a response message, in bytes. A larger one
+            /// fails the call with `ResourceExhausted`, without being read
+            /// in whole. A compressed message is limited both as received
+            /// and once decompressed.
+            ///
+            /// Rejecting a response resets its HTTP/2 stream. If many
+            /// responses may be rejected at once, see
+            /// `ClientConfigBuilder::http2_max_concurrent_reset_streams`.
+            ///
+            /// Default is 4 MiB. `usize::MAX` removes the limit.
+            pub fn set_max_decoding_message_size(&mut self, limit: usize) {
+                self.cli.set_max_decoding_message_size(limit);
+            }
+
+            /// Limits the size of a request message, in bytes, as sent, i.e.
+            /// after compression. A larger one fails the call with
+            /// `ResourceExhausted`.
+            ///
+            /// Default is no limit.
+            pub fn set_max_encoding_message_size(&mut self, limit: usize) {
+                self.cli.set_max_encoding_message_size(limit);
+            }
+
             #(
             #[allow(dead_code)]
             #methods
