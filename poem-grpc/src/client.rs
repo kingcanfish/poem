@@ -26,6 +26,7 @@ use crate::{
         create_decode_response_body, create_encode_request_body, create_encode_unary_request_body,
         decode_single_response_message, discard_body,
     },
+    timeout::{deadline_from_headers, stream_with_deadline, with_deadline},
 };
 
 pub(crate) type BoxBody = http_body_util::combinators::BoxBody<Bytes, IoError>;
@@ -281,7 +282,22 @@ impl GrpcClient {
         self
     }
 
+    // Every call is bound by the deadline its `grpc-timeout` metadata gives it
+    // (see `Request::set_timeout`), counted from here: once it passes, the
+    // call's future or response stream is dropped, which resets its stream,
+    // and the call fails with `DeadlineExceeded`.
+
     pub async fn unary<T: Codec>(
+        &self,
+        path: &str,
+        codec: T,
+        request: Request<T::Encode>,
+    ) -> Result<Response<T::Decode>, Status> {
+        let deadline = deadline_from_headers(&request.metadata.headers)?;
+        with_deadline(deadline, self.call_unary(path, codec, request)).await
+    }
+
+    async fn call_unary<T: Codec>(
         &self,
         path: &str,
         mut codec: T,
@@ -331,6 +347,16 @@ impl GrpcClient {
     }
 
     pub async fn client_streaming<T: Codec>(
+        &self,
+        path: &str,
+        codec: T,
+        request: Request<Streaming<T::Encode>>,
+    ) -> Result<Response<T::Decode>, Status> {
+        let deadline = deadline_from_headers(&request.metadata.headers)?;
+        with_deadline(deadline, self.call_client_streaming(path, codec, request)).await
+    }
+
+    async fn call_client_streaming<T: Codec>(
         &self,
         path: &str,
         mut codec: T,
@@ -387,6 +413,19 @@ impl GrpcClient {
     pub async fn server_streaming<T: Codec>(
         &self,
         path: &str,
+        codec: T,
+        request: Request<T::Encode>,
+    ) -> Result<Response<Streaming<T::Decode>>, Status> {
+        let deadline = deadline_from_headers(&request.metadata.headers)?;
+        let mut resp =
+            with_deadline(deadline, self.call_server_streaming(path, codec, request)).await?;
+        resp.message = stream_with_deadline(deadline, resp.message);
+        Ok(resp)
+    }
+
+    async fn call_server_streaming<T: Codec>(
+        &self,
+        path: &str,
         mut codec: T,
         request: Request<T::Encode>,
     ) -> Result<Response<Streaming<T::Decode>>, Status> {
@@ -434,6 +473,22 @@ impl GrpcClient {
     }
 
     pub async fn bidirectional_streaming<T: Codec>(
+        &self,
+        path: &str,
+        codec: T,
+        request: Request<Streaming<T::Encode>>,
+    ) -> Result<Response<Streaming<T::Decode>>, Status> {
+        let deadline = deadline_from_headers(&request.metadata.headers)?;
+        let mut resp = with_deadline(
+            deadline,
+            self.call_bidirectional_streaming(path, codec, request),
+        )
+        .await?;
+        resp.message = stream_with_deadline(deadline, resp.message);
+        Ok(resp)
+    }
+
+    async fn call_bidirectional_streaming<T: Codec>(
         &self,
         path: &str,
         mut codec: T,
@@ -1388,5 +1443,174 @@ mod tests {
             let expected = Some("identity, gzip, zstd".to_string());
             assert_eq!(sent, [expected.clone(), expected]);
         }
+    }
+
+    /// A client whose server responds `7` after `delay`, then, when
+    /// streaming, with `7` again after every `delay`, and the `grpc-timeout`
+    /// headers it received.
+    fn slow_client(
+        delay: std::time::Duration,
+    ) -> (GrpcClient, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let timeouts = Arc::new(std::sync::Mutex::new(vec![]));
+        let cli = GrpcClient::from_endpoint(poem::endpoint::make({
+            let timeouts = timeouts.clone();
+            move |req: HttpRequest| {
+                let timeout = req.header("grpc-timeout").map(str::to_string);
+                timeouts.lock().unwrap().push(timeout);
+                let streaming = req.uri().path().ends_with("ServerStreaming");
+                async move {
+                    tokio::time::sleep(delay).await;
+                    let body = if streaming {
+                        let frames = futures_util::stream::unfold((), move |()| async move {
+                            tokio::time::sleep(delay).await;
+                            Some((Ok::<_, IoError>(Frame::data(data_frame(7))), ()))
+                        });
+                        BodyExt::boxed(StreamBody::new(frames)).into()
+                    } else {
+                        ok_response()
+                    };
+                    HttpResponse::builder()
+                        .content_type("application/grpc")
+                        .body(body)
+                }
+            }
+        }));
+        (cli, timeouts)
+    }
+
+    fn request_with_timeout(timeout: std::time::Duration) -> Request<TestMsg> {
+        let mut request = Request::new(TestMsg { value: 1 });
+        request.set_timeout(timeout);
+        request
+    }
+
+    const MILLIS: fn(u64) -> std::time::Duration = std::time::Duration::from_millis;
+
+    /// A call that takes longer than its timeout fails with
+    /// `DeadlineExceeded` when it expires, and one that doesn't is not
+    /// affected. The timeout is sent to the server.
+    #[tokio::test(start_paused = true)]
+    async fn call_timeout() {
+        let codec = ProstCodec::<TestMsg, TestMsg>::default;
+        let (cli, timeouts) = slow_client(MILLIS(200));
+
+        let start = tokio::time::Instant::now();
+        let status = cli
+            .unary(
+                "/test.Test/Unary",
+                codec(),
+                request_with_timeout(MILLIS(150)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert_eq!(status.message(), Some("deadline exceeded"));
+        assert_eq!(start.elapsed(), MILLIS(150));
+
+        let mut request =
+            Request::new_streaming(futures_util::stream::iter(vec![Ok(TestMsg { value: 1 })]));
+        request.set_timeout(MILLIS(150));
+        let start = tokio::time::Instant::now();
+        let status = cli
+            .client_streaming("/test.Test/ClientStreaming", codec(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert_eq!(start.elapsed(), MILLIS(150));
+
+        let resp = cli
+            .unary(
+                "/test.Test/Unary",
+                codec(),
+                request_with_timeout(MILLIS(250)),
+            )
+            .await;
+        assert_eq!(resp.unwrap().into_inner().value, 7);
+
+        // No timeout, no header.
+        assert_eq!(unary(&cli).await.unwrap(), 7);
+
+        let timeouts: Vec<_> = timeouts.lock().unwrap().clone();
+        assert_eq!(
+            timeouts,
+            [
+                Some("150000u".to_string()),
+                Some("150000u".to_string()),
+                Some("250000u".to_string()),
+                None
+            ]
+        );
+    }
+
+    /// The timeout of a call with a streaming response runs until the
+    /// stream's end: the messages received by then are followed by
+    /// `DeadlineExceeded`.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_call_timeout() {
+        let codec = ProstCodec::<TestMsg, TestMsg>::default;
+        let (cli, _) = slow_client(MILLIS(100));
+
+        // Expires before the response starts.
+        let res = cli
+            .server_streaming(
+                "/test.Test/ServerStreaming",
+                codec(),
+                request_with_timeout(MILLIS(50)),
+            )
+            .await;
+        assert_eq!(res.err().unwrap().code(), Code::DeadlineExceeded);
+
+        // Expires in the middle of it.
+        let start = tokio::time::Instant::now();
+        let mut stream = cli
+            .server_streaming(
+                "/test.Test/ServerStreaming",
+                codec(),
+                request_with_timeout(MILLIS(350)),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stream.next().await.unwrap().unwrap().value, 7);
+        assert_eq!(stream.next().await.unwrap().unwrap().value, 7);
+        let status = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert_eq!(start.elapsed(), MILLIS(350));
+        assert!(stream.next().await.is_none());
+
+        let mut request =
+            Request::new_streaming(futures_util::stream::iter(vec![Ok(TestMsg { value: 1 })]));
+        request.set_timeout(MILLIS(50));
+        let res = cli
+            .bidirectional_streaming("/test.Test/BidirectionalStreaming", codec(), request)
+            .await;
+        assert_eq!(res.err().unwrap().code(), Code::DeadlineExceeded);
+    }
+
+    /// `grpc-timeout` set as metadata is a timeout too, and a malformed one
+    /// fails the call before it is sent.
+    #[tokio::test(start_paused = true)]
+    async fn timeout_from_metadata() {
+        let codec = ProstCodec::<TestMsg, TestMsg>::default;
+        let (cli, timeouts) = slow_client(MILLIS(200));
+
+        let mut request = Request::new(TestMsg { value: 1 });
+        request.metadata_mut().insert("grpc-timeout", "100m");
+        let status = cli
+            .unary("/test.Test/Unary", codec(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+
+        let mut request = Request::new(TestMsg { value: 1 });
+        request.metadata_mut().insert("grpc-timeout", "100ms");
+        let status = cli
+            .unary("/test.Test/Unary", codec(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(status.message(), Some("malformed grpc-timeout: 100ms"));
+
+        assert_eq!(*timeouts.lock().unwrap(), [Some("100m".to_string())]);
     }
 }

@@ -1,12 +1,16 @@
 use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
+    time::Duration,
 };
 
 use futures_util::Stream;
 use http::Extensions;
 
-use crate::{Metadata, Status, Streaming};
+use crate::{
+    Metadata, Status, Streaming,
+    timeout::{GRPC_TIMEOUT, timeout_header},
+};
 
 /// A GRPC request
 pub struct Request<T> {
@@ -55,6 +59,36 @@ impl<T> Request<T> {
     #[inline]
     pub fn into_inner(self) -> T {
         self.message
+    }
+
+    /// Sets the time the call made with this request may take, from the
+    /// moment it starts. It has no effect on a request a server received.
+    ///
+    /// The client fails the call with [`Code::DeadlineExceeded`] when it
+    /// hasn't completed by then, including, for a streaming response, reading
+    /// it to its end. The timeout is also sent to the server in the
+    /// `grpc-timeout` header, so it can stop working on a call nobody waits
+    /// for; a `poem-grpc` server does.
+    ///
+    /// The header holds 8 digits and a unit: a timeout that doesn't fit is
+    /// rounded up, by less than a hundred-thousandth of it. Setting the
+    /// `grpc-timeout` metadata directly has the same effect.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::time::Duration;
+    /// # use poem_grpc::Request;
+    /// let mut request = Request::new(());
+    /// request.set_timeout(Duration::from_secs(5));
+    /// assert_eq!(request.metadata().get("grpc-timeout"), Some("5000000u"));
+    /// ```
+    ///
+    /// [`Code::DeadlineExceeded`]: crate::Code::DeadlineExceeded
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.metadata
+            .headers
+            .insert(GRPC_TIMEOUT, timeout_header(timeout));
     }
 
     /// Returns a reference to the metadata.

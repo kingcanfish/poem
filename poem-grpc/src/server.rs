@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
 use http::HeaderValue;
 use poem::{Body, Request, Response};
+use tokio::time::Instant;
 
 use crate::{
     Code, CompressionEncoding, Metadata, MethodType, Request as GrpcRequest,
@@ -14,6 +15,7 @@ use crate::{
     service::{
         BidirectionalStreamingService, ClientStreamingService, ServerStreamingService, UnaryService,
     },
+    timeout::{deadline_from_headers, stream_with_deadline, with_deadline},
 };
 
 /// Tags the request with the [`MethodType`] of the method it is routed to.
@@ -81,16 +83,19 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
         resp
     }
 
-    /// Returns the encoding of the request's messages, and keeps the
-    /// configured encoding for the response's only if the client accepts it.
-    fn negotiate_encodings(
+    /// Reads what the request's headers say about the call: the encoding of
+    /// its messages, and the deadline its `grpc-timeout` gives it, counted
+    /// from now. Keeps the configured encoding for the response's messages
+    /// only if the client accepts it.
+    fn read_call_headers(
         &mut self,
         headers: &http::HeaderMap,
-    ) -> Result<Option<CompressionEncoding>, Status> {
+    ) -> Result<(Option<CompressionEncoding>, Option<Instant>), Status> {
+        let deadline = deadline_from_headers(headers)?;
         let incoming_encoding = get_request_encoding(headers, self.accept_compressed)?;
         self.send_compressed =
             select_response_encoding(headers, self.send_compressed, incoming_encoding);
-        Ok(incoming_encoding)
+        Ok((incoming_encoding, deadline))
     }
 
     pub async fn unary<S>(mut self, service: S, request: Request) -> Response
@@ -99,8 +104,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
     {
         let (parts, body) = request.into_parts();
         let mut resp = self.create_response();
-        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
-            Ok(incoming_encoding) => incoming_encoding,
+        let (incoming_encoding, deadline) = match self.read_call_headers(&parts.headers) {
+            Ok(call_headers) => call_headers,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
                 return resp;
@@ -113,20 +118,19 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
             self.max_decoding_message_size,
         );
 
-        let res = match read_single_message(&mut stream).await {
-            Ok(message) => {
-                service
-                    .call(GrpcRequest {
-                        metadata: Metadata {
-                            headers: parts.headers,
-                        },
-                        message,
-                        extensions: parts.extensions,
-                    })
-                    .await
-            }
-            Err(status) => Err(status),
-        };
+        let res = with_deadline(deadline, async {
+            let message = read_single_message(&mut stream).await?;
+            service
+                .call(GrpcRequest {
+                    metadata: Metadata {
+                        headers: parts.headers,
+                    },
+                    message,
+                    extensions: parts.extensions,
+                })
+                .await
+        })
+        .await;
 
         match res {
             Ok(grpc_resp) => {
@@ -157,8 +161,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
     {
         let (parts, body) = request.into_parts();
         let mut resp = self.create_response();
-        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
-            Ok(incoming_encoding) => incoming_encoding,
+        let (incoming_encoding, deadline) = match self.read_call_headers(&parts.headers) {
+            Ok(call_headers) => call_headers,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
                 return resp;
@@ -171,15 +175,17 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
             self.max_decoding_message_size,
         );
 
-        let res = service
-            .call(GrpcRequest {
+        let res = with_deadline(
+            deadline,
+            service.call(GrpcRequest {
                 metadata: Metadata {
                     headers: parts.headers,
                 },
                 extensions: parts.extensions,
                 message: stream,
-            })
-            .await;
+            }),
+        )
+        .await;
 
         match res {
             Ok(grpc_resp) => {
@@ -212,8 +218,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
     {
         let (parts, body) = request.into_parts();
         let mut resp = self.create_response();
-        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
-            Ok(incoming_encoding) => incoming_encoding,
+        let (incoming_encoding, deadline) = match self.read_call_headers(&parts.headers) {
+            Ok(call_headers) => call_headers,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
                 return resp;
@@ -226,27 +232,26 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
             self.max_decoding_message_size,
         );
 
-        let res = match read_single_message(&mut stream).await {
-            Ok(message) => {
-                service
-                    .call(GrpcRequest {
-                        metadata: Metadata {
-                            headers: parts.headers,
-                        },
-                        message,
-                        extensions: parts.extensions,
-                    })
-                    .await
-            }
-            Err(status) => Err(status),
-        };
+        let res = with_deadline(deadline, async {
+            let message = read_single_message(&mut stream).await?;
+            service
+                .call(GrpcRequest {
+                    metadata: Metadata {
+                        headers: parts.headers,
+                    },
+                    message,
+                    extensions: parts.extensions,
+                })
+                .await
+        })
+        .await;
 
         match res {
             Ok(grpc_resp) => {
                 let GrpcResponse { metadata, message } = grpc_resp;
                 let body = create_encode_response_body(
                     self.codec.encoder(),
-                    message,
+                    stream_with_deadline(deadline, message),
                     self.send_compressed,
                     self.max_encoding_message_size,
                 );
@@ -272,8 +277,8 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
     {
         let (parts, body) = request.into_parts();
         let mut resp = self.create_response();
-        let incoming_encoding = match self.negotiate_encodings(&parts.headers) {
-            Ok(incoming_encoding) => incoming_encoding,
+        let (incoming_encoding, deadline) = match self.read_call_headers(&parts.headers) {
+            Ok(call_headers) => call_headers,
             Err(status) => {
                 resp.headers_mut().extend(status.to_headers());
                 return resp;
@@ -286,22 +291,24 @@ impl<'a, T: Codec> GrpcServer<'a, T> {
             self.max_decoding_message_size,
         );
 
-        let res = service
-            .call(GrpcRequest {
+        let res = with_deadline(
+            deadline,
+            service.call(GrpcRequest {
                 metadata: Metadata {
                     headers: parts.headers,
                 },
                 message: stream,
                 extensions: parts.extensions,
-            })
-            .await;
+            }),
+        )
+        .await;
 
         match res {
             Ok(grpc_resp) => {
                 let GrpcResponse { metadata, message } = grpc_resp;
                 let body = create_encode_response_body(
                     self.codec.encoder(),
-                    message,
+                    stream_with_deadline(deadline, message),
                     self.send_compressed,
                     self.max_encoding_message_size,
                 );
@@ -1197,6 +1204,444 @@ mod tests {
         async fn uncompressed_message_with_encoding() {
             let resp = call(None, &[GZIP], &[("grpc-encoding", "gzip")], &THREE[..]).await;
             assert_seven(&resp, false).await;
+        }
+    }
+
+    mod deadline {
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use http::HeaderMap;
+        use http_body_util::BodyExt;
+        use tokio::time::Instant;
+
+        use super::*;
+        use crate::client::BoxBody;
+
+        /// What became of a handler: whether it ran, and whether it, or its
+        /// response stream, was dropped before its end.
+        #[derive(Default)]
+        struct Fate {
+            called: AtomicBool,
+            cancelled: AtomicBool,
+        }
+
+        /// Marks the handler as cancelled unless disarmed.
+        struct CancelGuard(Arc<Fate>, bool);
+
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        /// Sleeps for as many milliseconds as the request says, or as the
+        /// first request of a stream says, before responding with it. When
+        /// streaming the response, does so before every message, endlessly.
+        #[derive(Clone, Default)]
+        struct Slow(Arc<Fate>);
+
+        impl Slow {
+            async fn sleep(&self, millis: i32) -> i32 {
+                self.0.called.store(true, Ordering::SeqCst);
+                let mut guard = CancelGuard(self.0.clone(), false);
+                tokio::time::sleep(Duration::from_millis(millis as u64)).await;
+                guard.1 = true;
+                millis
+            }
+
+            fn stream(&self, millis: i32) -> Streaming<i32> {
+                self.0.called.store(true, Ordering::SeqCst);
+                let guard = CancelGuard(self.0.clone(), false);
+                Streaming::new(futures_util::stream::unfold(
+                    guard,
+                    move |guard| async move {
+                        tokio::time::sleep(Duration::from_millis(millis as u64)).await;
+                        Some((Ok(millis), guard))
+                    },
+                ))
+            }
+        }
+
+        impl UnaryService<i32> for Slow {
+            type Response = i32;
+
+            async fn call(&self, request: GrpcRequest<i32>) -> Result<GrpcResponse<i32>, Status> {
+                Ok(GrpcResponse::new(self.sleep(request.into_inner()).await))
+            }
+        }
+
+        impl ClientStreamingService<i32> for Slow {
+            type Response = i32;
+
+            async fn call(
+                &self,
+                request: GrpcRequest<Streaming<i32>>,
+            ) -> Result<GrpcResponse<i32>, Status> {
+                let millis = request.into_inner().try_next().await?.unwrap();
+                Ok(GrpcResponse::new(self.sleep(millis).await))
+            }
+        }
+
+        impl ServerStreamingService<i32> for Slow {
+            type Response = i32;
+
+            async fn call(
+                &self,
+                request: GrpcRequest<i32>,
+            ) -> Result<GrpcResponse<Streaming<i32>>, Status> {
+                Ok(GrpcResponse::new_streaming(
+                    self.stream(request.into_inner()),
+                ))
+            }
+        }
+
+        impl BidirectionalStreamingService<i32> for Slow {
+            type Response = i32;
+
+            async fn call(
+                &self,
+                request: GrpcRequest<Streaming<i32>>,
+            ) -> Result<GrpcResponse<Streaming<i32>>, Status> {
+                let millis = request.into_inner().try_next().await?.unwrap();
+                Ok(GrpcResponse::new_streaming(self.stream(millis)))
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Method {
+            Unary,
+            ClientStreaming,
+            ServerStreaming,
+            BidirectionalStreaming,
+        }
+
+        use Method::*;
+
+        fn message(value: i32) -> Bytes {
+            let mut buf = BytesMut::new();
+            buf.put_slice(&[0, 0, 0, 0, 4]);
+            buf.put_i32(value);
+            buf.freeze()
+        }
+
+        /// The outcome of a call: the response messages, the `grpc-status`,
+        /// whether it came in a Trailers-Only response, the time the call
+        /// took, and what became of the handler.
+        struct Outcome {
+            messages: usize,
+            status: String,
+            trailers_only: bool,
+            elapsed: Duration,
+            called: bool,
+            cancelled: bool,
+        }
+
+        /// Calls `Slow` with `timeout` as `grpc-timeout` and a request made
+        /// of `body`.
+        async fn call_with_body(method: Method, timeout: Option<&str>, body: Body) -> Outcome {
+            let mut req = Request::builder().content_type("application/grpc");
+            if let Some(timeout) = timeout {
+                req = req.header("grpc-timeout", timeout);
+            }
+            let req = req.body(body);
+            let slow = Slow::default();
+            let fate = slow.0.clone();
+            let server = GrpcServer::new(I32Codec, None, &[]);
+            let start = Instant::now();
+            let resp = match method {
+                Unary => server.unary(slow, req).await,
+                ClientStreaming => server.client_streaming(slow, req).await,
+                ServerStreaming => server.server_streaming(slow, req).await,
+                BidirectionalStreaming => server.bidirectional_streaming(slow, req).await,
+            };
+            let (parts, body) = resp.into_parts();
+            let mut body: BoxBody = body.into();
+            let mut messages = 0;
+            let mut trailers: Option<HeaderMap> = None;
+            while let Some(frame) = body.frame().await {
+                match frame.unwrap().into_data() {
+                    Ok(_) => messages += 1,
+                    Err(frame) => trailers = Some(frame.into_trailers().unwrap()),
+                }
+            }
+            let elapsed = start.elapsed();
+            drop(body);
+            let trailers_only = trailers.is_none();
+            let headers = trailers.unwrap_or(parts.headers);
+            Outcome {
+                messages,
+                status: headers["grpc-status"].to_str().unwrap().to_string(),
+                trailers_only,
+                elapsed,
+                called: fate.called.load(Ordering::SeqCst),
+                cancelled: fate.cancelled.load(Ordering::SeqCst),
+            }
+        }
+
+        /// Calls `Slow` with `timeout` as `grpc-timeout` and `millis` as the
+        /// request.
+        async fn call(method: Method, timeout: Option<&str>, millis: i32) -> Outcome {
+            call_with_body(method, timeout, Body::from_bytes(message(millis))).await
+        }
+
+        const MILLIS: fn(u64) -> Duration = Duration::from_millis;
+
+        /// A handler that takes longer than the request's `grpc-timeout` is
+        /// dropped when it expires, and the call fails with
+        /// `DeadlineExceeded`.
+        #[tokio::test(start_paused = true)]
+        async fn handler_is_cancelled_at_deadline() {
+            for method in [Unary, ClientStreaming] {
+                let outcome = call(method, Some("100m"), 5000).await;
+                assert_eq!(outcome.status, "4", "{method:?}");
+                assert!(outcome.trailers_only);
+                assert_eq!(outcome.elapsed, MILLIS(100));
+                assert!(outcome.called && outcome.cancelled);
+            }
+        }
+
+        /// A handler that responds before the deadline is not affected, nor
+        /// one called without a `grpc-timeout`.
+        #[tokio::test(start_paused = true)]
+        async fn handler_within_deadline() {
+            for method in [Unary, ClientStreaming] {
+                for timeout in [Some("100m"), Some("1H"), Some("99999999H"), None] {
+                    let outcome = call(method, timeout, 99).await;
+                    assert_eq!(outcome.status, "0", "{method:?} {timeout:?}");
+                    assert_eq!(outcome.messages, 1);
+                    assert_eq!(outcome.elapsed, MILLIS(99));
+                    assert!(outcome.called && !outcome.cancelled);
+                }
+                // Without a deadline, a handler may take as long as it likes.
+                let outcome = call(method, None, 3_600_000).await;
+                assert_eq!(outcome.status, "0", "{method:?}");
+            }
+        }
+
+        /// A response stream is cut at the deadline: the messages sent by
+        /// then are followed by `DeadlineExceeded`, and the handler's stream
+        /// is dropped.
+        #[tokio::test(start_paused = true)]
+        async fn response_stream_ends_at_deadline() {
+            for method in [ServerStreaming, BidirectionalStreaming] {
+                let outcome = call(method, Some("100m"), 30).await;
+                assert_eq!(outcome.status, "4", "{method:?}");
+                assert_eq!(outcome.messages, 3);
+                assert!(!outcome.trailers_only);
+                assert_eq!(outcome.elapsed, MILLIS(100));
+                assert!(outcome.called && outcome.cancelled);
+            }
+        }
+
+        /// The time a client takes to send its request counts: a request
+        /// that doesn't end fails at the deadline.
+        #[tokio::test(start_paused = true)]
+        async fn request_is_read_within_deadline() {
+            fn stalled() -> Body {
+                Body::from_bytes_stream(
+                    futures_util::stream::iter([Ok::<_, IoError>(message(1))])
+                        .chain(futures_util::stream::pending()),
+                )
+            }
+
+            // These read the whole request before calling the handler.
+            for method in [Unary, ServerStreaming] {
+                let outcome = call_with_body(method, Some("100m"), stalled()).await;
+                assert_eq!(outcome.status, "4", "{method:?}");
+                assert!(outcome.trailers_only);
+                assert_eq!(outcome.elapsed, MILLIS(100));
+                assert!(!outcome.called);
+            }
+        }
+
+        /// A zero timeout has expired on arrival: the handler isn't called,
+        /// even one that would respond at once.
+        #[tokio::test(start_paused = true)]
+        async fn zero_timeout() {
+            for method in [
+                Unary,
+                ClientStreaming,
+                ServerStreaming,
+                BidirectionalStreaming,
+            ] {
+                for millis in [0, 10] {
+                    let outcome = call(method, Some("0n"), millis).await;
+                    assert_eq!(outcome.status, "4", "{method:?}");
+                    assert_eq!(outcome.messages, 0);
+                    assert!(outcome.trailers_only);
+                    assert_eq!(outcome.elapsed, Duration::ZERO);
+                    assert!(!outcome.called);
+                }
+            }
+        }
+
+        /// Responds with an endless stream of messages that are always ready.
+        struct Flood;
+
+        impl ServerStreamingService<i32> for Flood {
+            type Response = i32;
+
+            async fn call(
+                &self,
+                _request: GrpcRequest<i32>,
+            ) -> Result<GrpcResponse<Streaming<i32>>, Status> {
+                Ok(GrpcResponse::new_streaming(
+                    futures_util::stream::repeat_with(|| Ok(1)),
+                ))
+            }
+        }
+
+        /// A response stream that never makes the server wait is cut at the
+        /// deadline too.
+        #[tokio::test(start_paused = true)]
+        async fn ready_response_stream_ends_at_deadline() {
+            let req = Request::builder()
+                .content_type("application/grpc")
+                .header("grpc-timeout", "100m")
+                .body(message(1));
+            let resp = GrpcServer::new(I32Codec, None, &[])
+                .server_streaming(Flood, req)
+                .await;
+            let mut body: BoxBody = resp.into_body().into();
+            let mut messages = 0;
+            let status = loop {
+                let frame = body.frame().await.expect("the response ended").unwrap();
+                match frame.into_data() {
+                    Ok(_) => messages += 1,
+                    Err(frame) => break frame.into_trailers().unwrap()["grpc-status"].clone(),
+                }
+                // A client reading a message every 30 ms.
+                tokio::time::sleep(MILLIS(30)).await;
+            };
+            assert_eq!(status, "4");
+            assert_eq!(messages, 4);
+        }
+
+        /// A malformed `grpc-timeout` fails the call with `Internal`, without
+        /// calling the handler.
+        #[tokio::test(start_paused = true)]
+        async fn malformed_timeout() {
+            for method in [
+                Unary,
+                ClientStreaming,
+                ServerStreaming,
+                BidirectionalStreaming,
+            ] {
+                for timeout in ["", "100", "1s", "100000000S", "-1S"] {
+                    let outcome = call(method, Some(timeout), 10).await;
+                    assert_eq!(outcome.status, "13", "{method:?} {timeout:?}");
+                    assert!(outcome.trailers_only);
+                    assert!(!outcome.called);
+                }
+            }
+        }
+
+        /// Over a connection: a client's timeout fails its call on time, the
+        /// server drops the handler, and the connection serves other calls.
+        #[tokio::test]
+        async fn timeout_over_http2() {
+            let slow = Slow::default();
+            let fate = slow.0.clone();
+            let app =
+                poem::Route::new()
+                    .at(
+                        "/unary",
+                        poem::endpoint::make({
+                            let slow = slow.clone();
+                            move |req| {
+                                let slow = slow.clone();
+                                async move {
+                                    GrpcServer::new(I32Codec, None, &[]).unary(slow, req).await
+                                }
+                            }
+                        }),
+                    )
+                    .at(
+                        "/stream",
+                        poem::endpoint::make(move |req| {
+                            let slow = slow.clone();
+                            async move {
+                                GrpcServer::new(I32Codec, None, &[])
+                                    .server_streaming(slow, req)
+                                    .await
+                            }
+                        }),
+                    );
+            let acceptor = TcpListener::bind("127.0.0.1:0")
+                .into_acceptor()
+                .await
+                .unwrap();
+            let addr = *acceptor.local_addr()[0].as_socket_addr().unwrap();
+            tokio::spawn(Server::new_with_acceptor(acceptor).run(app));
+            let cli = GrpcClient::new(
+                ClientConfig::builder()
+                    .uri(format!("http://{addr}"))
+                    .build()
+                    .unwrap(),
+            );
+            let request = |millis: i32, timeout: Option<Duration>| {
+                let mut request = GrpcRequest::new(millis);
+                if let Some(timeout) = timeout {
+                    request.set_timeout(timeout);
+                }
+                request
+            };
+            let wait_for_cancellation = || async {
+                for _ in 0..500 {
+                    if fate.cancelled.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    tokio::time::sleep(MILLIS(10)).await;
+                }
+                panic!("the handler wasn't dropped");
+            };
+
+            // Within the timeout.
+            let resp = cli
+                .unary("/unary", I32Codec, request(10, Some(MILLIS(10_000))))
+                .await;
+            assert_eq!(resp.unwrap().into_inner(), 10);
+            assert!(!fate.cancelled.load(Ordering::SeqCst));
+
+            // A unary call that takes 60 s, with a timeout of 200 ms.
+            let start = Instant::now();
+            let status = cli
+                .unary("/unary", I32Codec, request(60_000, Some(MILLIS(200))))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), Code::DeadlineExceeded);
+            assert!(start.elapsed() >= MILLIS(200));
+            assert!(start.elapsed() < MILLIS(5000), "{:?}", start.elapsed());
+            wait_for_cancellation().await;
+
+            // An endless stream of a message every 50 ms, with a timeout of
+            // 300 ms.
+            let start = Instant::now();
+            let mut stream = cli
+                .server_streaming("/stream", I32Codec, request(50, Some(MILLIS(300))))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut messages = 0;
+            let status = loop {
+                match stream.try_next().await {
+                    Ok(Some(_)) => messages += 1,
+                    Ok(None) => panic!("the stream ended"),
+                    Err(status) => break status,
+                }
+            };
+            assert_eq!(status.code(), Code::DeadlineExceeded);
+            assert!((1..=6).contains(&messages), "{messages}");
+            assert!(start.elapsed() >= MILLIS(300));
+            assert!(start.elapsed() < MILLIS(5000), "{:?}", start.elapsed());
+            wait_for_cancellation().await;
+
+            // The connection is still good.
+            let resp = cli.unary("/unary", I32Codec, request(10, None)).await;
+            assert_eq!(resp.unwrap().into_inner(), 10);
         }
     }
 }

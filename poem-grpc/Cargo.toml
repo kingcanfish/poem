@@ -27,7 +27,7 @@ poem = { workspace = true, default-features = true }
 
 futures-util.workspace = true
 async-stream = "0.3.6"
-tokio = { workspace = true, features = ["io-util", "rt", "sync", "net"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "net", "time"] }
 itoa = "1.0.18"
 percent-encoding = "2.3.2"
 bytes.workspace = true
@@ -49,6 +49,9 @@ tower-service = "0.3.3"
 webpki-roots = "1.0.9"
 async-compression = { version = "0.4.50", optional = true, features = ["tokio"] }
 sync_wrapper = { version = "1.0.2", features = ["futures"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [build-dependencies]
 poem-grpc-build.workspace = true

@@ -37,6 +37,7 @@ mod status;
 mod streaming;
 #[cfg(test)]
 mod test_harness;
+mod timeout;
 
 pub use client::{ClientBuilderError, ClientConfig, ClientConfigBuilder};
 pub use compression::CompressionEncoding;

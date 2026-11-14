@@ -69,6 +69,9 @@ impl TestHarness for TestHarnessService {
         if let Some(value) = req.metadata().get("mydata") {
             resp.metadata_mut().insert("mydata", value);
         }
+        if let Some(value) = req.metadata().get("grpc-timeout") {
+            resp.metadata_mut().insert("x-timeout", value);
+        }
         if let Some(method_type) = req.extensions().get::<crate::MethodType>() {
             resp.metadata_mut()
                 .insert("x-method-type", method_type.as_str());
@@ -544,5 +547,23 @@ mod tests {
             .unwrap();
         assert_eq!(resp.metadata().get("grpc-encoding"), None);
         assert_eq!(resp.into_inner().value, 30);
+    }
+
+    /// A timeout set on a request of a generated client reaches the handler
+    /// as `grpc-timeout` metadata, and expires on a server that is too slow.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout() {
+        let cli = create_cli();
+        let mut request = Request::new(UnaryRequest { a: 10, b: 20 });
+        request.set_timeout(Duration::from_secs(5));
+        let resp = cli.unary_metadata(request).await.unwrap();
+        assert_eq!(resp.metadata().get("x-timeout"), Some("5000000u"));
+        assert_eq!(resp.into_inner().value, 30);
+
+        // Summing a client stream that never ends.
+        let mut request = Request::new_streaming(futures_util::stream::pending());
+        request.set_timeout(Duration::from_secs(5));
+        let status = cli.client_streaming(request).await.unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded);
     }
 }
